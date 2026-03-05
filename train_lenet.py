@@ -35,7 +35,7 @@ def train_lenet():
               l1.w, l1.b, l2.w, l2.b, l3.w, l3.b]
     optimizer = SGD(params, lr=0.01)
     metrics = Metrics()
-    batch_size = 4096
+    batch_size = 32
     epochs = 25
 
     def forward(xb):

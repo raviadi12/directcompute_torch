@@ -60,7 +60,7 @@ class AlexNet(nn.Module):
         return x
 
 def train_alexnet_pytorch():
-    X, Y = load_pets(limit_per_class=1000)
+    X, Y = load_pets(limit_per_class=2000)
     idx = np.arange(len(X))
     np.random.shuffle(idx)
     X, Y = X[idx], Y[idx]
@@ -77,7 +77,7 @@ def train_alexnet_pytorch():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.01)
 
-    batch_size = 32
+    batch_size = 64
     epochs = 10
 
     train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(Y_train).long())
