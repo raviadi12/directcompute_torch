@@ -1,0 +1,41 @@
+# Build outputs
+*.obj
+*.exp
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# Precompiled shaders
+shaders/*.cso
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Datasets (large / not ours)
+mnist/
+PetImages/
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# Temporary conversion scripts
+convert_to_raw.py
+revert_to_structured.py
+
+# Debug/train logs
+debug_output.txt
+train_output.txt
+train_output2.txt
+train_log.txt
+
+# VS Code
+.vscode/
+
+# Resolved docs
+*.md.resolved
