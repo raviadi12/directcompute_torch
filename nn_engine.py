@@ -29,6 +29,58 @@ lib.ReleaseBufferBatch.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uin
 lib.FlushGPU.argtypes = []
 lib.FlushGPU.restype = None
 
+# Fused C++ operations (eliminate multiple DLL round-trips per layer)
+lib.MatMulAlloc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+lib.MatMulAlloc.restype = ctypes.c_void_p
+lib.ConvForwardFused.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # x, filters, bias
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # batch, inC, inH, inW
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # outC, kH, kW
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # stride, padding, actType
+    ctypes.POINTER(ctypes.c_void_p)]  # pIm2col
+lib.ConvForwardFused.restype = ctypes.c_void_p
+lib.ConvBackwardFused.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p,  # grad_output, fwd_output (nullable)
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # x, filters, im2col
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # batch, inC, inH, inW
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # outC, kH, kW
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # stride, padding, actType
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # x/filters/bias requires_grad
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]  # dF, dB, dIn
+lib.ConvBackwardFused.restype = None
+lib.MaxPoolForwardFused.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # x, batch, inC, inH, inW
+    ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]  # pool_size, stride, pIndices
+lib.MaxPoolForwardFused.restype = ctypes.c_void_p
+lib.MaxPoolBackwardFused.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p,  # grad_output, indices
+    ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,  # batch, inC, outH, outW
+    ctypes.c_uint]  # x_size
+lib.MaxPoolBackwardFused.restype = ctypes.c_void_p
+
+# Pool management APIs
+lib.WarmPool.argtypes = [ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_uint]
+lib.WarmPool.restype = None
+lib.GetPoolStats.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+lib.GetPoolStats.restype = None
+lib.ResetPoolStats.argtypes = []
+lib.ResetPoolStats.restype = None
+lib.GetPoolMemory.argtypes = []
+lib.GetPoolMemory.restype = ctypes.c_uint64
+lib.DrainPool.argtypes = []
+lib.DrainPool.restype = None
+
+# Graph replay APIs
+lib.ResolveShader.argtypes = [ctypes.c_char_p]
+lib.ResolveShader.restype = ctypes.c_void_p
+lib.RunSequence.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+lib.RunSequence.restype = None
+lib.RunSequenceWithSGD.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_float, ctypes.c_float]
+lib.RunSequenceWithSGD.restype = None
+
 lib.InitEngine()
 
 # ── GPU Detection ──
@@ -66,7 +118,7 @@ for s in shaders:
 # Compile GPU-specific matmul variant
 if not _IS_IGPU:
     lib.CompileShader(b"matmul_dgpu", "nn_matmul_dgpu.hlsl")
-    print("      Compiled dGPU matmul variant (TS=32, WPT=8, K_STEP=16)")
+    print("      Compiled dGPU matmul variant (TS=64, WPT=4, K_STEP=16)")
 else:
     print("      Using iGPU matmul variant (TS=64, WPT=4, K_STEP=32)")
 
@@ -391,16 +443,26 @@ class Tensor:
         if grad is None:
             grad = Tensor(np.ones(self.shape, dtype=np.float32), track=False)
         self.grad = grad
+        # Iterative topological sort (avoids Python recursion overhead)
         topo = []
         visited = set()
-        def build_topo(v):
-            if v not in visited:
+        stack = [self]
+        while stack:
+            v = stack[-1]
+            if v in visited:
+                stack.pop()
+                continue
+            # Check if all children visited
+            children_done = True
+            if v._ctx:
+                for i in v._ctx.inputs:
+                    if isinstance(i, Tensor) and i not in visited:
+                        stack.append(i)
+                        children_done = False
+            if children_done:
                 visited.add(v)
-                if v._ctx:
-                    for i in v._ctx.inputs:
-                        if isinstance(i, Tensor): build_topo(i)
+                stack.pop()
                 topo.append(v)
-        build_topo(self)
         for v in reversed(topo):
             if v._ctx: v._ctx.backward(v.grad)
 
@@ -418,14 +480,12 @@ class Function:
 # Matmul dispatch helper — GPU-adaptive
 _TILE_U = 16  # Universal shader tile size (always 16)
 if _IS_IGPU:
-    # iGPU: TS=64, WPT=4 — maximize compute-to-load ratio for limited bandwidth
     _TILE_C = 64
     _COARSEN_THRESHOLD = 64
     _MM_COARSE_SHADER = b"matmul_coarsened"
 else:
-    # dGPU: TS=32, WPT=8 — smaller tiles for more workgroups across many SMs
-    _TILE_C = 32
-    _COARSEN_THRESHOLD = 32
+    _TILE_C = 64
+    _COARSEN_THRESHOLD = 64
     _MM_COARSE_SHADER = b"matmul_dgpu"
 
 def _run_mm(a_buf, b_buf, out_buf, M, K, N, flags=0):
@@ -440,20 +500,17 @@ class MatMul(Function):
     def forward(self, A, B):
         self.inputs = (A, B)
         M, K, N = A.shape[0], A.shape[1], B.shape[1]
-        out_handle = lib.CreateBuffer(None, M * N)
-        _run_mm(A.gpu_buf, B.gpu_buf, out_handle, M, K, N, 0)
+        out_handle = lib.MatMulAlloc(A.gpu_buf, B.gpu_buf, M, K, N, 0)
         res = Tensor.from_gpu(out_handle, (M, N), requires_grad=A.requires_grad or B.requires_grad)
         res._ctx = self
         return res
     def backward(self, grad_output):
         A, B = self.inputs
         if A.requires_grad:
-            out_handle = lib.CreateBuffer(None, A.size)
-            _run_mm(grad_output.gpu_buf, B.gpu_buf, out_handle, A.shape[0], B.shape[1], B.shape[0], 2)
+            out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, A.shape[0], B.shape[1], B.shape[0], 2)
             A._accumulate_grad(Tensor.from_gpu(out_handle, A.shape, track=True))
         if B.requires_grad:
-            out_handle = lib.CreateBuffer(None, B.size)
-            _run_mm(A.gpu_buf, grad_output.gpu_buf, out_handle, A.shape[1], A.shape[0], grad_output.shape[1], 1)
+            out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, A.shape[1], A.shape[0], grad_output.shape[1], 1)
             B._accumulate_grad(Tensor.from_gpu(out_handle, B.shape, track=True))
 
 class Conv2D(Function):
@@ -467,27 +524,18 @@ class Conv2D(Function):
         self.stride, self.padding, self.actType = stride, padding, actType
         batch, inC, inH, inW = x.shape
         outC, _, kH, kW = filters.shape
-        outH, outW = (inH + 2 * padding - kH) // stride + 1, (inW + 2 * padding - kW) // stride + 1
-        
-        totalRow, totalCol = inC * kH * kW, batch * outH * outW
-        im2col_handle = lib.CreateBuffer(None, totalRow * totalCol)
-        self.im2col_handle = im2col_handle
-        
-        _dispatch(b"im2col", (x.gpu_buf,), (im2col_handle,),
-                  (totalCol + 15)//16, (totalRow + 15)//16, 1,
-                  u1=batch, u2=inC, u3=inH, u4=inW, u5=kH, u6=stride, u7=padding, u8=outH, u9=outW, cbSize=36)
-        
-        mm_handle = lib.CreateBuffer(None, outC * totalCol)
-        _run_mm(filters.gpu_buf, im2col_handle, mm_handle, outC, totalRow, totalCol, 0)
-        
-        out_handle = lib.CreateBuffer(None, batch * outC * outH * outW)
-        _dispatch(b"conv_reshape", (mm_handle, bias.gpu_buf), (out_handle,),
-                  (totalCol+15)//16, (outC+15)//16, 1,
-                  u1=batch, u2=outC, u3=outH, u4=outW, u5=actType, cbSize=20)
-        
-        lib.ReleaseBuffer(mm_handle)
-        res = Tensor.from_gpu(out_handle, (batch, outC, outH, outW), requires_grad=x.requires_grad or filters.requires_grad or bias.requires_grad)
-        # Store output reference for fused relu backward
+        outH = (inH + 2 * padding - kH) // stride + 1
+        outW = (inW + 2 * padding - kW) // stride + 1
+
+        pIm2col = ctypes.c_void_p()
+        out_handle = lib.ConvForwardFused(
+            x.gpu_buf, filters.gpu_buf, bias.gpu_buf,
+            batch, inC, inH, inW, outC, kH, kW,
+            stride, padding, actType, ctypes.byref(pIm2col))
+        self.im2col_handle = pIm2col.value
+
+        res = Tensor.from_gpu(out_handle, (batch, outC, outH, outW),
+                              requires_grad=x.requires_grad or filters.requires_grad or bias.requires_grad)
         self.fwd_output = res if actType != 0 else None
         res._ctx = self
         return res
@@ -496,46 +544,31 @@ class Conv2D(Function):
         x, filters, bias = self.inputs
         batch, inC, inH, inW = x.shape
         outC, _, kH, kW = filters.shape
-        outH, outW = grad_output.shape[2], grad_output.shape[3]
-        totalRow, totalCol = inC * kH * kW, batch * outH * outW
-        
-        # Fused grad reshape + ReLU gradient (saves 1 dispatch + 1 buffer)
-        grad_reshaped = lib.CreateBuffer(None, outC * totalCol)
-        if self.actType == 1 and self.fwd_output is not None:
-            _dispatch(b"conv_grad_reshape_relu",
-                      (grad_output.gpu_buf, self.fwd_output.gpu_buf), (grad_reshaped,),
-                      (totalCol + 15)//16, (outC + 15)//16, 1,
-                      u1=batch, u5=outC, u8=outH, u9=outW, cbSize=36)
-            self.fwd_output = None
-        else:
-            _dispatch(b"conv_grad_reshape", (grad_output.gpu_buf,), (grad_reshaped,),
-                      (totalCol + 15)//16, (outC + 15)//16, 1,
-                      u1=batch, u5=outC, u8=outH, u9=outW, cbSize=36)
-        
-        if filters.requires_grad:
-            dF_handle = lib.CreateBuffer(None, outC * totalRow)
-            _run_mm(grad_reshaped, self.im2col_handle, dF_handle, outC, totalCol, totalRow, 2)
-            filters._accumulate_grad(Tensor.from_gpu(dF_handle, filters.shape, track=True))
-            
-        if bias.requires_grad:
-            dB_handle = lib.CreateBuffer(None, outC)
-            _dispatch(b"bias_grad", (grad_reshaped,), (dB_handle,),
-                      outC, 1, 1, u1=totalCol, u2=outC, u3=1, u4=totalCol)
-            bias._accumulate_grad(Tensor.from_gpu(dB_handle, bias.shape, track=True))
-            
-        if x.requires_grad:
-            dIcol_handle = lib.CreateBuffer(None, totalRow * totalCol)
-            _run_mm(filters.gpu_buf, grad_reshaped, dIcol_handle, totalRow, outC, totalCol, 1)
-            dIn_handle = lib.CreateBuffer(None, x.size)
-            _dispatch(b"col2im", (dIcol_handle,), (dIn_handle,),
-                      (x.size + 255)//256, 1, 1,
-                      u1=batch, u2=inC, u3=inH, u4=inW, u5=kH, u6=self.stride, u7=self.padding, u8=outH, u9=outW, cbSize=36)
-            lib.ReleaseBuffer(dIcol_handle)
-            x._accumulate_grad(Tensor.from_gpu(dIn_handle, x.shape, track=True))
-            
-        lib.ReleaseBuffer(grad_reshaped)
-        lib.ReleaseBuffer(self.im2col_handle)
-        self.im2col_handle = None
+
+        pDFilters = ctypes.c_void_p()
+        pDBias = ctypes.c_void_p()
+        pDInput = ctypes.c_void_p()
+
+        fwd_buf = self.fwd_output.gpu_buf if self.fwd_output else None
+        lib.ConvBackwardFused(
+            grad_output.gpu_buf, fwd_buf,
+            x.gpu_buf, filters.gpu_buf, self.im2col_handle,
+            batch, inC, inH, inW, outC, kH, kW,
+            self.stride, self.padding, self.actType,
+            1 if x.requires_grad else 0,
+            1 if filters.requires_grad else 0,
+            1 if bias.requires_grad else 0,
+            ctypes.byref(pDFilters), ctypes.byref(pDBias), ctypes.byref(pDInput))
+
+        self.fwd_output = None
+        self.im2col_handle = None  # released by ConvBackwardFused
+
+        if pDFilters.value:
+            filters._accumulate_grad(Tensor.from_gpu(pDFilters.value, filters.shape, track=True))
+        if pDBias.value:
+            bias._accumulate_grad(Tensor.from_gpu(pDBias.value, bias.shape, track=True))
+        if pDInput.value:
+            x._accumulate_grad(Tensor.from_gpu(pDInput.value, x.shape, track=True))
 
 class MaxPool2D(Function):
     def __del__(self):
@@ -546,12 +579,15 @@ class MaxPool2D(Function):
     def forward(self, x, pool_size=2, stride=2):
         self.inputs = (x,)
         batch, inC, inH, inW = x.shape
-        outH, outW = (inH - pool_size)//stride + 1, (inW - pool_size)//stride + 1
-        out_handle = lib.CreateBuffer(None, batch * inC * outH * outW)
-        self.indices_handle = lib.CreateBuffer(None, batch * inC * outH * outW)
-        _dispatch(b"maxpool_forward", (x.gpu_buf,), (out_handle, self.indices_handle),
-                  (outW + 15)//16, (outH + 15)//16, batch * inC,
-                  u1=batch, u2=inC, u3=inH, u4=inW, u5=pool_size, u6=stride, u7=outH, u8=outW, cbSize=32)
+        outH = (inH - pool_size) // stride + 1
+        outW = (inW - pool_size) // stride + 1
+
+        pIndices = ctypes.c_void_p()
+        out_handle = lib.MaxPoolForwardFused(
+            x.gpu_buf, batch, inC, inH, inW, pool_size, stride,
+            ctypes.byref(pIndices))
+        self.indices_handle = pIndices.value
+
         res = Tensor.from_gpu(out_handle, (batch, inC, outH, outW), requires_grad=x.requires_grad)
         res._ctx = self
         return res
@@ -559,13 +595,12 @@ class MaxPool2D(Function):
     def backward(self, grad_output):
         x = self.inputs[0]
         batch, inC, outH, outW = grad_output.shape
-        dInput = lib.CreateBuffer(None, x.size)
-        lib.ClearBuffer(dInput)
-        _dispatch(b"maxpool_backward", (grad_output.gpu_buf, self.indices_handle), (dInput,),
-                  (outW + 15)//16, (outH + 15)//16, batch * inC,
-                  u1=batch, u2=inC, u3=outH, u4=outW)
-        lib.ReleaseBuffer(self.indices_handle)
-        self.indices_handle = None
+
+        dInput = lib.MaxPoolBackwardFused(
+            grad_output.gpu_buf, self.indices_handle,
+            batch, inC, outH, outW, x.size)
+        self.indices_handle = None  # released by MaxPoolBackwardFused
+
         x._accumulate_grad(Tensor.from_gpu(dInput, x.shape, track=True))
 
 class Flatten(Function):
@@ -787,7 +822,439 @@ class Metrics:
 
 
 def end_batch():
-    """End-of-batch cleanup: release intermediate tensors and flush GPU.
-    Call this after optimizer.step() in every training batch."""
+    """End-of-batch cleanup: release intermediate tensors and periodically flush GPU.
+    Call this after optimizer.step() in every training batch.
+    
+    Flush strategy: submit GPU commands every N batches instead of every batch.
+    Intel iGPU Flush() has ~4ms driver overhead per call, so reducing flush
+    frequency from every batch to every ~10 batches saves significant time.
+    """
     release_all_buffers()
-    lib.FlushGPU()
+    end_batch._count += 1
+    if end_batch._count % end_batch.flush_interval == 0:
+        lib.FlushGPU()
+
+end_batch._count = 0
+end_batch.flush_interval = 10  # flush every N batches (default: 10)
+
+
+# ── Buffer Pool Warm-up ─────────────────────────────────────────────────────
+
+def warm_pool(sizes, copies=2):
+    """Pre-allocate GPU buffers of given sizes into the pool.
+    
+    Args:
+        sizes: list/set of element counts (ints) to pre-warm
+        copies: how many copies of each size to keep in pool
+    
+    Example:
+        warm_pool(discover_buffer_sizes(forward, batch=32), copies=2)
+    """
+    sizes_arr = (ctypes.c_uint * len(sizes))(*sizes)
+    lib.WarmPool(sizes_arr, len(sizes), copies)
+
+
+def discover_buffer_sizes(forward_fn, params, X_batch, Y_batch, optimizer):
+    """Run 1 training batch and discover all buffer sizes created.
+    Returns a set of element counts suitable for warm_pool().
+    
+    Args:
+        forward_fn: callable(xb) -> logits
+        params: list of parameter Tensors
+        X_batch, Y_batch: numpy arrays for a single batch  
+        optimizer: SGD instance
+    """
+    sizes = set()
+    orig_create = lib.CreateBuffer
+    def _track_create(data, count):
+        sizes.add(int(count))
+        return orig_create(data, count)
+    lib.CreateBuffer = _track_create
+    
+    try:
+        optimizer.zero_grad()
+        xb = Tensor(X_batch, track=True)
+        yb = Tensor(Y_batch, track=True)
+        logits = forward_fn(xb)
+        loss = softmax_ce(logits, yb)
+        loss.backward()
+        optimizer.step(clip=1.0)
+        end_batch()
+    finally:
+        lib.CreateBuffer = orig_create
+    
+    return sizes
+
+
+def auto_warm(forward_fn, params, X_sample, Y_sample, optimizer, copies=2):
+    """Discover buffer sizes and warm the pool in one call.
+    Call this once before training to eliminate cold-start allocation overhead.
+    
+    Args:
+        forward_fn: callable(xb) -> logits
+        params: list of parameter Tensors
+        X_sample, Y_sample: one batch of data (numpy arrays)
+        optimizer: SGD instance
+        copies: pool copies per size
+    """
+    sizes = discover_buffer_sizes(forward_fn, params, X_sample, Y_sample, optimizer)
+    warm_pool(sizes, copies)
+    lib.ResetPoolStats()
+    return sizes
+
+
+def get_pool_stats():
+    """Return (hits, misses) from the engine buffer pool."""
+    hits = ctypes.c_uint64(0)
+    misses = ctypes.c_uint64(0)
+    lib.GetPoolStats(ctypes.byref(hits), ctypes.byref(misses))
+    return hits.value, misses.value
+
+
+def get_pool_memory():
+    """Return total bytes currently held in the buffer pool."""
+    return lib.GetPoolMemory()
+
+
+def drain_pool():
+    """Free all pooled buffers, reclaiming VRAM."""
+    lib.DrainPool()
+
+
+# ── Compute Graph: Record & Replay ──────────────────────────────────────────
+
+class _SeqCmd(ctypes.Structure):
+    """Matches C++ SeqCmd struct — 256-byte dispatch command."""
+    _fields_ = [
+        ("shader",   ctypes.c_void_p),
+        ("srvs",     ctypes.c_void_p * 8),
+        ("srvCount", ctypes.c_uint),
+        ("uavs",     ctypes.c_void_p * 4),
+        ("uavCount", ctypes.c_uint),
+        ("threads",  ctypes.c_uint * 3),
+        ("cbData",   ctypes.c_ubyte * 64),
+        ("cbSize",   ctypes.c_uint),
+        ("pad",      ctypes.c_uint * 1),
+    ]
+
+
+class ComputeGraph:
+    """Record one forward+backward pass, then replay from C++ with zero Python overhead.
+    
+    For fixed-shape models (same batch_size every iteration), all dispatch parameters
+    are identical across batches — only input data changes. Record once, replay N times.
+    
+    Usage:
+        graph = ComputeGraph()
+        graph.trace(forward_fn, optimizer, X_batch, Y_batch, params, clip=1.0)
+        # Training loop — one DLL call per batch instead of ~40:
+        for epoch in ...:
+            for xb, yb in batches:
+                loss_val, logits_data = graph.replay(xb, yb)
+    """
+    
+    def __init__(self):
+        self._cmds = []              # list of _SeqCmd during recording
+        self._cmd_array = None       # contiguous ctypes array after compile
+        self._cmd_count = 0
+        self._intermediates = []     # pre-allocated GPU buffers (kept alive)
+        self._input_handle = None    # GPU buffer for input data
+        self._label_handle = None    # GPU buffer for labels
+        self._loss_handle = None     # GPU buffer to read loss from
+        self._logits_handle = None   # GPU buffer to read logits from
+        self._param_bufs = None      # ctypes array of param handles
+        self._grad_bufs = None       # ctypes array of grad handles
+        self._param_sizes = None     # ctypes array of param sizes
+        self._num_params = 0
+        self._lr = 0.0
+        self._clip = 0.0
+        self._compiled = False
+        self._shader_cache = {}      # name -> resolved shader pointer
+        self._loss_size = 0
+        self._logits_shape = None
+    
+    def _resolve_shader(self, name):
+        """Resolve shader name to pointer, with caching."""
+        if name not in self._shader_cache:
+            self._shader_cache[name] = lib.ResolveShader(name)
+        return self._shader_cache[name]
+    
+    def trace(self, forward_fn, optimizer, X_batch, Y_batch, params, clip=1.0):
+        """Run one batch (forward + backward + SGD) while recording all dispatches.
+        
+        After this call, the graph is compiled and ready for replay().
+        Intermediate buffers are pre-allocated and kept alive.
+        
+        Args:
+            forward_fn: callable(Tensor) -> Tensor (logits)
+            optimizer: SGD instance
+            X_batch, Y_batch: numpy arrays for one batch
+            params: list of parameter Tensors
+            clip: gradient clipping value
+        """
+        self._lr = optimizer.lr
+        self._clip = clip
+        self._cmds = []
+        self._intermediates = []
+        
+        # Pre-allocate persistent input/label buffers
+        X = X_batch if X_batch.dtype == np.float32 else X_batch.astype(np.float32)
+        Y = Y_batch if Y_batch.dtype == np.float32 else Y_batch.astype(np.float32)
+        self._input_handle = lib.CreateBuffer(
+            X.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), X.size)
+        self._label_handle = lib.CreateBuffer(
+            Y.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), Y.size)
+        self._input_size = X.size
+        self._label_size = Y.size
+        self._input_shape = X_batch.shape
+        self._label_shape = Y_batch.shape
+        
+        # Install dispatch hooks to capture commands
+        orig_RunShader = lib.RunShader
+        orig_RunShaderRaw = lib.RunShaderRaw
+        captured = self  # closure reference
+        
+        def _hook_run(name, srvs, srvCount, uavs, uavCount, threads, cb, cbSize):
+            """Capture dispatch command AND execute it."""
+            cmd = _SeqCmd()
+            cmd.shader = captured._resolve_shader(name)
+            for i in range(srvCount):
+                cmd.srvs[i] = srvs[i]
+            cmd.srvCount = srvCount
+            for i in range(uavCount):
+                cmd.uavs[i] = uavs[i]
+            cmd.uavCount = uavCount
+            cmd.threads[0] = threads[0]
+            cmd.threads[1] = threads[1]
+            cmd.threads[2] = threads[2]
+            if cb and cbSize > 0:
+                cb_bytes = (ctypes.c_ubyte * cbSize).from_address(
+                    ctypes.cast(cb, ctypes.c_void_p).value if not isinstance(cb, int) 
+                    else cb)
+                ctypes.memmove(cmd.cbData, cb_bytes, min(cbSize, 64))
+            cmd.cbSize = cbSize
+            captured._cmds.append(cmd)
+            # Still execute normally during trace
+            orig_RunShader(name, srvs, srvCount, uavs, uavCount, threads, cb, cbSize)
+        
+        # Hook both RunShader and RunShaderRaw
+        lib.RunShader = _hook_run
+        lib.RunShaderRaw = _hook_run
+        
+        # Track buffer creations to keep intermediates alive
+        created_bufs = []
+        orig_CreateBuffer = lib.CreateBuffer
+        
+        def _hook_create(data, count):
+            handle = orig_CreateBuffer(data, count)
+            created_bufs.append(handle)
+            return handle
+        lib.CreateBuffer = _hook_create
+        
+        # Also intercept batched SGD to capture param/grad handles
+        sgd_captured = [False]
+        orig_SGDBatch = lib.SGDBatch
+        def _hook_sgd(p, g, s, n, lr, clip):
+            sgd_captured[0] = True
+            orig_SGDBatch(p, g, s, n, lr, clip)
+        lib.SGDBatch = _hook_sgd
+        
+        try:
+            # Run one complete training step
+            optimizer.zero_grad()
+            
+            # Create input tensors using our persistent buffers
+            lib.AddRefBuffer(self._input_handle)
+            xb = Tensor.from_gpu(self._input_handle, X_batch.shape, 
+                                 requires_grad=True, track=True)
+            xb.data = X
+            
+            lib.AddRefBuffer(self._label_handle)
+            yb = Tensor.from_gpu(self._label_handle, Y_batch.shape,
+                                 requires_grad=False, track=True)
+            yb.data = Y
+            
+            logits = forward_fn(xb)
+            loss = softmax_ce(logits, yb)
+            
+            # Save handles for readback during replay
+            self._loss_handle = loss.gpu_buf
+            lib.AddRefBuffer(self._loss_handle)
+            self._loss_size = loss.size
+            
+            self._logits_handle = logits.gpu_buf
+            lib.AddRefBuffer(self._logits_handle)
+            self._logits_shape = logits.shape
+            
+            loss.backward()
+            optimizer.step(clip=clip)
+            
+            # DON'T call end_batch — we need buffers alive for replay
+        finally:
+            lib.RunShader = orig_RunShader
+            lib.RunShaderRaw = orig_RunShaderRaw
+            lib.CreateBuffer = orig_CreateBuffer
+            lib.SGDBatch = orig_SGDBatch
+        
+        # Keep ALL intermediate buffers alive (AddRef) so handles stay valid
+        for handle in created_bufs:
+            if handle:
+                lib.AddRefBuffer(handle)
+                self._intermediates.append(handle)
+        
+        # Set up SGD parameter arrays
+        self._num_params = len(params)
+        ParamArr = ctypes.c_void_p * self._num_params
+        SizeArr = ctypes.c_uint * self._num_params
+        GradArr = ctypes.c_void_p * self._num_params
+        self._param_bufs = ParamArr(*[p.gpu_buf for p in params])
+        self._param_sizes = SizeArr(*[p.size for p in params])
+        # Save gradient buffer handles NOW (before release_all_buffers destroys them)
+        self._grad_bufs = GradArr(*[p.grad.gpu_buf if p.grad else None for p in params])
+        # AddRef grad buffers to keep them alive
+        for i in range(self._num_params):
+            if self._grad_bufs[i]:
+                lib.AddRefBuffer(self._grad_bufs[i])
+        self._params_ref = params
+        
+        # Compile command array
+        self._compile()
+        
+        # Release trace-batch tensors (intermediates kept alive by our AddRef above)
+        release_all_buffers()
+        
+        return loss, logits
+    
+    def _compile(self):
+        """Build contiguous ctypes array from recorded commands."""
+        n = len(self._cmds)
+        CmdArray = _SeqCmd * n
+        self._cmd_array = CmdArray(*self._cmds)
+        self._cmd_count = n
+        self._compiled = True
+    
+    def replay(self, X_batch, Y_batch):
+        """Execute the recorded graph with new input data.
+        
+        Returns (loss_value, logits_array) — no Python dispatch overhead.
+        One DLL call for all ~39 dispatches + SGD.
+        """
+        if not self._compiled:
+            raise RuntimeError("Graph not compiled. Call trace() first.")
+        
+        # Update input buffers (2 DLL calls)
+        X = X_batch if X_batch.dtype == np.float32 else X_batch.astype(np.float32)
+        Y = Y_batch if Y_batch.dtype == np.float32 else Y_batch.astype(np.float32)
+        lib.UpdateBuffer(self._input_handle, 
+                        X.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        lib.UpdateBuffer(self._label_handle,
+                        Y.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        
+        # Zero gradients using saved handles
+        for i in range(self._num_params):
+            if self._grad_bufs[i]:
+                lib.ClearBuffer(self._grad_bufs[i])
+        
+        # Execute ALL dispatches in one C++ call (forward + backward)
+        lib.RunSequence(ctypes.cast(self._cmd_array, ctypes.c_void_p),
+                       self._cmd_count)
+        
+        # SGD update using saved gradient handles
+        lib.SGDBatch(self._param_bufs, self._grad_bufs, self._param_sizes,
+                    self._num_params, self._lr, self._clip)
+    
+    def read_loss(self):
+        """Read loss value from GPU (requires flush)."""
+        out = np.empty(self._loss_size, dtype=np.float32)
+        lib.ReadBuffer(self._loss_handle, 
+                      out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        return float(out[0])
+    
+    def read_logits(self):
+        """Read logits from GPU (requires flush)."""
+        out = np.empty(self._logits_shape, dtype=np.float32)
+        lib.ReadBuffer(self._logits_handle,
+                      out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        return out
+    
+    def release(self):
+        """Free all pre-allocated intermediate buffers."""
+        for handle in self._intermediates:
+            if handle:
+                lib.ReleaseBuffer(handle)
+        self._intermediates = []
+        if self._input_handle:
+            lib.ReleaseBuffer(self._input_handle)
+            self._input_handle = None
+        if self._label_handle:
+            lib.ReleaseBuffer(self._label_handle)
+            self._label_handle = None
+        if self._loss_handle:
+            lib.ReleaseBuffer(self._loss_handle)
+            self._loss_handle = None
+        if self._logits_handle:
+            lib.ReleaseBuffer(self._logits_handle)
+            self._logits_handle = None
+        if self._grad_bufs:
+            for i in range(self._num_params):
+                if self._grad_bufs[i]:
+                    lib.ReleaseBuffer(self._grad_bufs[i])
+            self._grad_bufs = None
+        self._compiled = False
+    
+    def __del__(self):
+        self.release()
+
+
+# ── Reusable Input Tensor ────────────────────────────────────────────────────
+
+class ReusableTensor:
+    """A GPU tensor that reuses its buffer across batches via UpdateBuffer.
+    Avoids CreateBuffer overhead on every batch.
+    
+    Usage:
+        rb = ReusableTensor(shape=(32, 1, 28, 28))
+        for batch_data in batches:
+            xb = rb.update(batch_data)  # fast UpdateBuffer, no alloc
+    """
+    def __init__(self, shape, track=True):
+        self._max_size = _shape_size(shape)
+        self._shape = shape
+        self._handle = lib.CreateBuffer(None, self._max_size)
+        self._track = track
+    
+    def update(self, data):
+        """Upload new data and return a Tensor wrapping the same GPU buffer.
+        Data size must match the allocated size."""
+        if isinstance(data, np.ndarray):
+            if data.dtype != np.float32:
+                data = data.astype(np.float32)
+        else:
+            data = np.array(data, dtype=np.float32)
+        
+        size = data.size
+        if size != self._max_size:
+            # Size changed — reallocate (happens on last batch with fewer samples)
+            lib.ReleaseBuffer(self._handle)
+            self._handle = lib.CreateBuffer(
+                data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), size)
+            self._max_size = size
+            self._shape = data.shape
+        else:
+            lib.UpdateBuffer(self._handle, 
+                           data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            self._shape = data.shape
+        
+        # Create a lightweight Tensor wrapping this handle (AddRef to prevent double-free)
+        lib.AddRefBuffer(self._handle)
+        t = Tensor.from_gpu(self._handle, data.shape, requires_grad=False, track=self._track)
+        t.data = data
+        return t
+    
+    def release(self):
+        if self._handle:
+            lib.ReleaseBuffer(self._handle)
+            self._handle = None
+    
+    def __del__(self):
+        self.release()

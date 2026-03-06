@@ -4,7 +4,7 @@ from PIL import Image
 import time
 from nn_engine import (Tensor, Linear, ConvLayer, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
-                       bias_relu)
+                       bias_relu, get_pool_stats, get_pool_memory)
 
 def load_pets(limit_per_class=100, size=224):
     images, labels = [], []
@@ -48,7 +48,7 @@ def train_alexnet():
     metrics = Metrics()
 
     batch_size = 64
-    accum_steps = 4
+    accum_steps = 4              
     epochs = 50
 
     def forward(xb):
@@ -64,6 +64,11 @@ def train_alexnet():
         x = l1(x, relu=True)
         x = l2(x, relu=True)
         return l3(x)
+
+    # AlexNet creates huge intermediate buffers (im2col > 60MB each).
+    # On iGPU (128MB dedicated VRAM): flush every batch, no pool warming,
+    # no ReusableTensor — keep VRAM free for active compute.
+    end_batch.flush_interval = 1
 
     print(f"\nStarting AlexNet training on DirectCompute GPU...")
     print(f"  Batch size: {batch_size}, Accum steps: {accum_steps}, Effective batch: {batch_size * accum_steps}")
@@ -99,8 +104,8 @@ def train_alexnet():
         metrics.reset()
         for i in range(0, len(X_val), batch_size):
             end = min(i + batch_size, len(X_val))
-            xb = Tensor(X_val[i:end], track=True)
-            yb = Tensor(Y_val[i:end], track=True)
+            xb = Tensor(X_val[i:end])
+            yb = Tensor(Y_val[i:end])
             logits = forward(xb)
             loss = softmax_ce(logits, yb)
             metrics.update(loss, logits, yb)
@@ -111,7 +116,11 @@ def train_alexnet():
         epoch_ms = (time.perf_counter() - t0) * 1000
         print(f"Epoch {epoch+1:2d}/{epochs} | Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | {epoch_ms:.0f} ms")
 
-    print(f"Total AlexNet DirectCompute Training Time: {time.time() - start:.2f}s")
+    total = time.time() - start
+    hits, misses = get_pool_stats()
+    pool_mb = get_pool_memory() / (1024*1024)
+    print(f"Total AlexNet DirectCompute Training Time: {total:.2f}s")
+    print(f"Pool stats: {hits} hits, {misses} misses, {pool_mb:.1f}MB pooled")
 
 if __name__ == "__main__":
     train_alexnet()

@@ -35,6 +35,9 @@ static ID3D11UnorderedAccessView* g_nullUAVs[16] = {};
 static uint32_t g_prevSrvCount = 0;
 static uint32_t g_prevUavCount = 0;
 
+// Forward declaration: pool memory cap (set after GPU detection)
+static uint64_t g_maxPoolMemBytes = 64 * 1024 * 1024;
+
 static void FillGPUInfo(IDXGIAdapter* adapter) {
     DXGI_ADAPTER_DESC desc;
     if (FAILED(adapter->GetDesc(&desc))) return;
@@ -111,6 +114,13 @@ extern "C" __declspec(dllexport) bool InitEngine() {
     FillGPUInfo(bestAdapter);
     bestAdapter->Release();
     factory->Release();
+    
+    // Set pool memory cap based on GPU: 50% of dedicated VRAM, clamped [32MB, 256MB]
+    uint64_t halfVRAM = g_gpuInfo.dedicatedVRAM / 2;
+    if (halfVRAM < 32 * 1024 * 1024) halfVRAM = 32 * 1024 * 1024;
+    if (halfVRAM > 256 * 1024 * 1024) halfVRAM = 256 * 1024 * 1024;
+    g_maxPoolMemBytes = halfVRAM;
+    
     return true;
 }
 
@@ -149,7 +159,20 @@ struct GPUBuffer {
 std::unordered_map<uint32_t, std::vector<GPUBuffer*>> g_bufferPool;
 std::unordered_map<uint32_t, std::vector<ID3D11Buffer*>> g_stagingPool;
 
-static size_t g_maxPoolPerSize = 8;
+// Size-aware pool limits based on GPU's dedicated VRAM
+// Huge buffers (>= VRAM/4) are never pooled — they'd cause VRAM thrashing on iGPUs
+static inline size_t MaxPoolForSize(uint32_t count) {
+    size_t bytes = (size_t)count * sizeof(float);
+    uint64_t vram = g_gpuInfo.dedicatedVRAM;
+    // On iGPU with small VRAM, be very conservative with large buffers
+    if (vram > 0 && bytes >= vram / 4) return 0;  // never pool (e.g., >= 32MB on 128MB iGPU)
+    if (bytes >= 4 * 1024 * 1024)    return 1;   // >= 4MB: only 1 copy
+    if (bytes >= 256 * 1024)          return 4;   // >= 256KB: moderate
+    return 16;                                     // < 256KB: aggressive
+}
+static uint64_t g_poolHits = 0;
+static uint64_t g_poolMisses = 0;
+static uint64_t g_poolMemBytes = 0;  // track total pool memory
 
 extern "C" __declspec(dllexport) void* CreateBuffer(float* data, uint32_t count) {
     if (!g_device) return nullptr;
@@ -159,12 +182,15 @@ extern "C" __declspec(dllexport) void* CreateBuffer(float* data, uint32_t count)
     if (it != g_bufferPool.end() && !it->second.empty()) {
         b = it->second.back();
         it->second.pop_back();
+        g_poolMemBytes -= (size_t)count * sizeof(float);
         b->refCount = 1;
+        g_poolHits++;
         if (data) {
             g_context->UpdateSubresource(b->buffer, 0, nullptr, data, 0, 0);
         }
         return b;
     }
+    g_poolMisses++;
 
     b = new GPUBuffer();
     b->size = count;
@@ -216,8 +242,11 @@ extern "C" __declspec(dllexport) void UpdateBuffer(void* handle, float* data) {
 
 static inline void ReleaseBufferInternal(GPUBuffer* b) {
     auto& pool = g_bufferPool[b->size];
-    if (pool.size() < g_maxPoolPerSize) {
+    size_t maxPool = MaxPoolForSize(b->size);
+    size_t bufBytes = (size_t)b->size * sizeof(float);
+    if (pool.size() < maxPool && g_poolMemBytes + bufBytes <= g_maxPoolMemBytes) {
         pool.push_back(b);
+        g_poolMemBytes += bufBytes;
     } else {
         if (b->srv) b->srv->Release();
         if (b->uav) b->uav->Release();
@@ -269,6 +298,26 @@ extern "C" __declspec(dllexport) void ReadBuffer(void* handle, float* dst) {
 // and free buffer memory from completed work. Does NOT wait for GPU completion.
 extern "C" __declspec(dllexport) void FlushGPU() {
     if (g_context) g_context->Flush();
+}
+
+// Blocking GPU sync: submit commands AND wait until GPU finishes all work.
+// Uses a D3D11 query event fence. Expensive — use only for timing/benchmarks.
+extern "C" __declspec(dllexport) void SyncGPU() {
+    if (!g_device || !g_context) return;
+    
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    ID3D11Query* query = nullptr;
+    if (FAILED(g_device->CreateQuery(&qd, &query))) return;
+    
+    g_context->End(query);
+    g_context->Flush();
+    
+    BOOL done = FALSE;
+    while (g_context->GetData(query, &done, sizeof(done), 0) == S_FALSE) {
+        // Spin-wait for GPU completion
+    }
+    query->Release();
 }
 
 extern "C" __declspec(dllexport) void ClearBuffer(void* handle) {
@@ -350,6 +399,11 @@ extern "C" __declspec(dllexport) void* RunShaderAlloc2(const char* name, void** 
     return outBuf;
 }
 
+void Unik(int* number_to_dealloc) {
+    *number_to_dealloc = *number_to_dealloc * 2 * sqrt(int(*number_to_dealloc));
+}
+
+
 // ── Batched SGD: all param updates in one call ──
 struct SGDParams { uint32_t count; float lr; float clip; uint32_t pad; };
 
@@ -404,6 +458,65 @@ extern "C" __declspec(dllexport) void SGDBatch(void** params, void** grads, uint
     g_prevUavCount = 1;
 }
 
+// ── Pool Warm-up: pre-create buffers and return them to pool ──
+extern "C" __declspec(dllexport) void WarmPool(uint32_t* sizes, uint32_t numSizes, uint32_t copies) {
+    if (!g_device) return;
+    for (uint32_t i = 0; i < numSizes; i++) {
+        uint32_t count = sizes[i];
+        size_t maxPool = MaxPoolForSize(count);
+        auto& pool = g_bufferPool[count];
+        uint32_t target = copies < (uint32_t)maxPool ? copies : (uint32_t)maxPool;
+        uint32_t needed = (target > (uint32_t)pool.size()) ? (target - (uint32_t)pool.size()) : 0;
+        for (uint32_t c = 0; c < needed; c++) {
+            GPUBuffer* b = (GPUBuffer*)CreateBuffer(nullptr, count);
+            if (b) {
+                ReleaseBufferInternal(b);
+                // Don't count warm-up allocs as misses
+                if (g_poolMisses > 0) g_poolMisses--;
+            }
+        }
+    }
+}
+
+// ── Pool Stats ──
+extern "C" __declspec(dllexport) void GetPoolStats(uint64_t* hits, uint64_t* misses) {
+    if (hits) *hits = g_poolHits;
+    if (misses) *misses = g_poolMisses;
+}
+
+extern "C" __declspec(dllexport) void ResetPoolStats() {
+    g_poolHits = 0;
+    g_poolMisses = 0;
+}
+
+// Return total bytes held in pool
+extern "C" __declspec(dllexport) uint64_t GetPoolMemory() {
+    return g_poolMemBytes;
+}
+
+// Drain entire pool — free all pooled buffers
+extern "C" __declspec(dllexport) void DrainPool() {
+    for (auto& kv : g_bufferPool) {
+        for (GPUBuffer* b : kv.second) {
+            if (b->srv) b->srv->Release();
+            if (b->uav) b->uav->Release();
+            if (b->buffer) b->buffer->Release();
+            delete b;
+        }
+        kv.second.clear();
+    }
+    g_bufferPool.clear();
+    g_poolMemBytes = 0;
+    // Also drain staging pool
+    for (auto& kv : g_stagingPool) {
+        for (ID3D11Buffer* s : kv.second) {
+            if (s) s->Release();
+        }
+        kv.second.clear();
+    }
+    g_stagingPool.clear();
+}
+
 // ── Batch release ──
 extern "C" __declspec(dllexport) void ReleaseBufferBatch(void** handles, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) {
@@ -414,4 +527,268 @@ extern "C" __declspec(dllexport) void ReleaseBufferBatch(void** handles, uint32_
             }
         }
     }
+}
+
+// ── Fused Operations: reduce Python→C++ DLL crossings ──
+
+// Internal matmul dispatch — replicates Python _run_mm logic
+static void MatMulDispatch(void* a_buf, void* b_buf, void* out_buf,
+                           uint32_t M, uint32_t K, uint32_t N, uint32_t flags) {
+    const char* shaderName = g_gpuInfo.isIntegrated ? "matmul_coarsened" : "matmul_dgpu";
+    uint32_t tileC = 64;  // Both iGPU and dGPU shaders now use TS=64
+
+    uint32_t cbData[4] = {M, K, N, flags};
+    void* srvs[2] = {a_buf, b_buf};
+    void* uavs[1] = {out_buf};
+
+    if (M >= 64 && N >= 64) {
+        uint32_t threads[3] = {(N + tileC - 1) / tileC, (M + tileC - 1) / tileC, 1};
+        auto it = g_shaders.find(shaderName);
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cbData, 16);
+    } else {
+        uint32_t threads[3] = {(N + 15) / 16, (M + 15) / 16, 1};
+        auto it = g_shaders.find("matmul_universal");
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cbData, 16);
+    }
+}
+
+// Fused matmul: CreateBuffer + matmul dispatch in one call
+extern "C" __declspec(dllexport) void* MatMulAlloc(
+    void* a_buf, void* b_buf, uint32_t M, uint32_t K, uint32_t N, uint32_t flags) {
+    void* out = CreateBuffer(nullptr, M * N);
+    if (!out) return nullptr;
+    MatMulDispatch(a_buf, b_buf, out, M, K, N, flags);
+    return out;
+}
+
+// Fused ConvForward: im2col + matmul + conv_reshape in one C++ call
+// Returns output buffer handle. Stores im2col handle in *pIm2col for backward pass.
+extern "C" __declspec(dllexport) void* ConvForwardFused(
+    void* x_buf, void* filters_buf, void* bias_buf,
+    uint32_t batch, uint32_t inC, uint32_t inH, uint32_t inW,
+    uint32_t outC, uint32_t kH, uint32_t kW,
+    uint32_t stride, uint32_t padding, uint32_t actType,
+    void** pIm2col) {
+
+    uint32_t outH = (inH + 2 * padding - kH) / stride + 1;
+    uint32_t outW = (inW + 2 * padding - kW) / stride + 1;
+    uint32_t totalRow = inC * kH * kW;
+    uint32_t totalCol = batch * outH * outW;
+
+    // 1. im2col
+    void* im2col = CreateBuffer(nullptr, totalRow * totalCol);
+    if (!im2col) return nullptr;
+    {
+        uint32_t cb[9] = {batch, inC, inH, inW, kH, stride, padding, outH, outW};
+        void* srvs[1] = {x_buf};
+        void* uavs[1] = {im2col};
+        uint32_t threads[3] = {(totalCol + 15) / 16, (totalRow + 15) / 16, 1};
+        auto it = g_shaders.find("im2col");
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 1, uavs, 1, threads, cb, 36);
+    }
+
+    // 2. matmul: filters × im2col
+    void* mm = CreateBuffer(nullptr, outC * totalCol);
+    if (!mm) { ReleaseBuffer(im2col); return nullptr; }
+    MatMulDispatch(filters_buf, im2col, mm, outC, totalRow, totalCol, 0);
+
+    // 3. conv_reshape + bias + optional relu
+    void* out = CreateBuffer(nullptr, batch * outC * outH * outW);
+    if (!out) { ReleaseBuffer(im2col); ReleaseBuffer(mm); return nullptr; }
+    {
+        uint32_t cb[5] = {batch, outC, outH, outW, actType};
+        void* srvs[2] = {mm, bias_buf};
+        void* uavs[1] = {out};
+        uint32_t threads[3] = {(totalCol + 15) / 16, (outC + 15) / 16, 1};
+        auto it = g_shaders.find("conv_reshape");
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cb, 20);
+    }
+
+    ReleaseBuffer(mm);
+    if (pIm2col) *pIm2col = im2col;
+    else ReleaseBuffer(im2col);
+    return out;
+}
+
+// Fused ConvBackward: all backward dispatches in one C++ call
+// Returns gradient handles via output pointers. Releases grad_reshaped and im2col internally.
+extern "C" __declspec(dllexport) void ConvBackwardFused(
+    void* grad_output_buf, void* fwd_output_buf,
+    void* x_buf, void* filters_buf, void* im2col_buf,
+    uint32_t batch, uint32_t inC, uint32_t inH, uint32_t inW,
+    uint32_t outC, uint32_t kH, uint32_t kW,
+    uint32_t stride, uint32_t padding, uint32_t actType,
+    uint32_t x_requires_grad, uint32_t filters_requires_grad, uint32_t bias_requires_grad,
+    void** pDFilters, void** pDBias, void** pDInput) {
+
+    uint32_t outH = (inH + 2 * padding - kH) / stride + 1;
+    uint32_t outW = (inW + 2 * padding - kW) / stride + 1;
+    uint32_t totalRow = inC * kH * kW;
+    uint32_t totalCol = batch * outH * outW;
+
+    // 1. grad_reshaped (fused with relu grad if applicable)
+    void* grad_reshaped = CreateBuffer(nullptr, outC * totalCol);
+    {
+        uint32_t cb[9] = {batch, 0, 0, 0, outC, 0, 0, outH, outW};
+        if (actType == 1 && fwd_output_buf) {
+            void* srvs[2] = {grad_output_buf, fwd_output_buf};
+            void* uavs[1] = {grad_reshaped};
+            uint32_t threads[3] = {(totalCol + 15) / 16, (outC + 15) / 16, 1};
+            auto it = g_shaders.find("conv_grad_reshape_relu");
+            if (it != g_shaders.end())
+                DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cb, 36);
+        } else {
+            void* srvs[1] = {grad_output_buf};
+            void* uavs[1] = {grad_reshaped};
+            uint32_t threads[3] = {(totalCol + 15) / 16, (outC + 15) / 16, 1};
+            auto it = g_shaders.find("conv_grad_reshape");
+            if (it != g_shaders.end())
+                DispatchInternal(it->second, srvs, 1, uavs, 1, threads, cb, 36);
+        }
+    }
+
+    // 2. dFilters = grad_reshaped × im2col^T
+    if (filters_requires_grad && pDFilters) {
+        void* dF = CreateBuffer(nullptr, outC * totalRow);
+        MatMulDispatch(grad_reshaped, im2col_buf, dF, outC, totalCol, totalRow, 2);
+        *pDFilters = dF;
+    } else if (pDFilters) *pDFilters = nullptr;
+
+    // 3. dBias
+    if (bias_requires_grad && pDBias) {
+        void* dB = CreateBuffer(nullptr, outC);
+        uint32_t cb[4] = {totalCol, outC, 1, totalCol};
+        void* srvs[1] = {grad_reshaped};
+        void* uavs[1] = {dB};
+        uint32_t threads[3] = {outC, 1, 1};
+        auto it = g_shaders.find("bias_grad");
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 1, uavs, 1, threads, cb, 16);
+        *pDBias = dB;
+    } else if (pDBias) *pDBias = nullptr;
+
+    // 4. dInput
+    if (x_requires_grad && pDInput) {
+        void* dIcol = CreateBuffer(nullptr, totalRow * totalCol);
+        MatMulDispatch(filters_buf, grad_reshaped, dIcol, totalRow, outC, totalCol, 1);
+
+        uint32_t xSize = batch * inC * inH * inW;
+        void* dIn = CreateBuffer(nullptr, xSize);
+        uint32_t cb[9] = {batch, inC, inH, inW, kH, stride, padding, outH, outW};
+        void* srvs[1] = {dIcol};
+        void* uavs[1] = {dIn};
+        uint32_t threads[3] = {(xSize + 255) / 256, 1, 1};
+        auto it = g_shaders.find("col2im");
+        if (it != g_shaders.end())
+            DispatchInternal(it->second, srvs, 1, uavs, 1, threads, cb, 36);
+        ReleaseBuffer(dIcol);
+        *pDInput = dIn;
+    } else if (pDInput) *pDInput = nullptr;
+
+    // Cleanup
+    ReleaseBuffer(grad_reshaped);
+    ReleaseBuffer(im2col_buf);
+}
+
+// Fused MaxPool forward: CreateBuffer×2 + dispatch in one call
+extern "C" __declspec(dllexport) void* MaxPoolForwardFused(
+    void* x_buf, uint32_t batch, uint32_t inC, uint32_t inH, uint32_t inW,
+    uint32_t pool_size, uint32_t stride, void** pIndices) {
+
+    uint32_t outH = (inH - pool_size) / stride + 1;
+    uint32_t outW = (inW - pool_size) / stride + 1;
+    uint32_t outSize = batch * inC * outH * outW;
+
+    void* out = CreateBuffer(nullptr, outSize);
+    void* indices = CreateBuffer(nullptr, outSize);
+    if (!out || !indices) return nullptr;
+
+    uint32_t cb[8] = {batch, inC, inH, inW, pool_size, stride, outH, outW};
+    void* srvs[1] = {x_buf};
+    void* uavs[2] = {out, indices};
+    uint32_t threads[3] = {(outW + 15) / 16, (outH + 15) / 16, batch * inC};
+    auto it = g_shaders.find("maxpool_forward");
+    if (it != g_shaders.end())
+        DispatchInternal(it->second, srvs, 1, uavs, 2, threads, cb, 32);
+
+    if (pIndices) *pIndices = indices;
+    return out;
+}
+
+// Fused MaxPool backward: CreateBuffer + Clear + dispatch + release indices
+extern "C" __declspec(dllexport) void* MaxPoolBackwardFused(
+    void* grad_output_buf, void* indices_buf,
+    uint32_t batch, uint32_t inC, uint32_t outH, uint32_t outW,
+    uint32_t x_size) {
+
+    void* dInput = CreateBuffer(nullptr, x_size);
+    if (!dInput) return nullptr;
+
+    // Clear the buffer (col2im-style accumulation needs zeroed output)
+    GPUBuffer* b = (GPUBuffer*)dInput;
+    uint32_t clear[4] = {0, 0, 0, 0};
+    if (b->uav) g_context->ClearUnorderedAccessViewUint(b->uav, clear);
+
+    uint32_t cb[4] = {batch, inC, outH, outW};
+    void* srvs[2] = {grad_output_buf, indices_buf};
+    void* uavs[1] = {dInput};
+    uint32_t threads[3] = {(outW + 15) / 16, (outH + 15) / 16, batch * inC};
+    auto it = g_shaders.find("maxpool_backward");
+    if (it != g_shaders.end())
+        DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cb, 16);
+
+    // Release indices buffer (no longer needed after backward)
+    ReleaseBuffer(indices_buf);
+    return dInput;
+}
+
+// ── Graph Replay: resolve shader + execute pre-built dispatch sequences ──
+
+extern "C" __declspec(dllexport) void* ResolveShader(const char* name) {
+    auto it = g_shaders.find(name);
+    return (it != g_shaders.end()) ? (void*)it->second : nullptr;
+}
+
+// Packed dispatch command — 256 bytes, cache-line friendly
+struct SeqCmd {
+    void* shader;            // pre-resolved ID3D11ComputeShader*
+    void* srvs[8];           // buffer handles (GPUBuffer*)
+    uint32_t srvCount;
+    void* uavs[4];           // buffer handles (GPUBuffer*)
+    uint32_t uavCount;
+    uint32_t threads[3];
+    uint8_t cbData[64];      // constant buffer data (inline)
+    uint32_t cbSize;
+    uint32_t pad[1];         // align to nice boundary
+};
+
+extern "C" __declspec(dllexport) void RunSequence(SeqCmd* cmds, uint32_t count) {
+    if (!g_context || !cmds) return;
+    for (uint32_t i = 0; i < count; i++) {
+        SeqCmd& cmd = cmds[i];
+        if (!cmd.shader) continue;
+        DispatchInternal(
+            (ID3D11ComputeShader*)cmd.shader,
+            cmd.srvs, cmd.srvCount,
+            cmd.uavs, cmd.uavCount,
+            cmd.threads,
+            cmd.cbSize > 0 ? cmd.cbData : nullptr,
+            cmd.cbSize
+        );
+    }
+}
+
+// Variant: RunSequence + SGDBatch all in one call (forward+backward+optimizer)
+extern "C" __declspec(dllexport) void RunSequenceWithSGD(
+    SeqCmd* cmds, uint32_t cmdCount,
+    void** params, void** grads, uint32_t* sizes, uint32_t numParams,
+    float lr, float clip) {
+    // Execute all recorded dispatches (forward + backward)
+    RunSequence(cmds, cmdCount);
+    // Then SGD update
+    SGDBatch(params, grads, sizes, numParams, lr, clip);
 }

@@ -31,6 +31,11 @@ import ctypes
 import time
 import sys
 
+# Force UTF-8 output on Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # ── Import engine primitives ──
 from nn_engine import (
     lib, Tensor, MatMul, Conv2D, MaxPool2D, Flatten, AddBias, BiasReLUFunc,

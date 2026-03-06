@@ -4,7 +4,7 @@ from PIL import Image
 import time
 from nn_engine import (Tensor, Linear, ConvLayer, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
-                       bias_relu)
+                       bias_relu, auto_warm, get_pool_stats, ReusableTensor)
 
 def load_mnist(limit_per_class=100):
     images, labels = [], []
@@ -48,6 +48,14 @@ def train_lenet():
         x = l2(x, relu=True)        # fused bias+relu
         return l3(x)
 
+    # ── Pool warm-up: discover buffer sizes and pre-fill pool ──
+    sizes = auto_warm(forward, params, X_train[:batch_size], Y_train[:batch_size], optimizer, copies=3)
+    print(f"Pool warmed: {len(sizes)} buffer sizes pre-allocated")
+
+    # ── Reusable input tensors (avoids CreateBuffer per batch) ──
+    rx = ReusableTensor((batch_size, 1, 28, 28))
+    ry = ReusableTensor((batch_size,))
+
     print("\nStarting LeNet training on DirectCompute GPU...")
     start = time.time()
 
@@ -57,8 +65,8 @@ def train_lenet():
         for i in range(0, len(X_train), batch_size):
             end = min(i + batch_size, len(X_train))
             optimizer.zero_grad()
-            xb = Tensor(X_train[i:end], track=True)
-            yb = Tensor(Y_train[i:end], track=True)
+            xb = rx.update(X_train[i:end])
+            yb = ry.update(Y_train[i:end])
 
             logits = forward(xb)
             loss = softmax_ce(logits, yb)
@@ -74,8 +82,8 @@ def train_lenet():
         metrics.reset()
         for i in range(0, len(X_val), batch_size):
             end = min(i + batch_size, len(X_val))
-            xb = Tensor(X_val[i:end], track=True)
-            yb = Tensor(Y_val[i:end], track=True)
+            xb = rx.update(X_val[i:end])
+            yb = ry.update(Y_val[i:end])
             logits = forward(xb)
             loss = softmax_ce(logits, yb)
             metrics.update(loss, logits, yb)
@@ -85,7 +93,12 @@ def train_lenet():
 
         print(f"Epoch {epoch+1:2d}/{epochs} | Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
-    print(f"Total LeNet DirectCompute Training Time: {time.time() - start:.2f}s")
+    total = time.time() - start
+    hits, misses = get_pool_stats()
+    print(f"Total LeNet DirectCompute Training Time: {total:.2f}s")
+    print(f"Pool stats: {hits} hits, {misses} misses ({hits/(hits+misses)*100:.1f}% hit rate)")
+    rx.release()
+    ry.release()
 
 if __name__ == "__main__":
     train_lenet()
