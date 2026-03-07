@@ -115,11 +115,15 @@ extern "C" __declspec(dllexport) bool InitEngine() {
     bestAdapter->Release();
     factory->Release();
     
-    // Set pool memory cap based on GPU: 50% of dedicated VRAM, clamped [32MB, 256MB]
-    uint64_t halfVRAM = g_gpuInfo.dedicatedVRAM / 2;
-    if (halfVRAM < 32 * 1024 * 1024) halfVRAM = 32 * 1024 * 1024;
-    if (halfVRAM > 256 * 1024 * 1024) halfVRAM = 256 * 1024 * 1024;
-    g_maxPoolMemBytes = halfVRAM;
+    // Set pool memory cap: iGPU uses shared memory, dGPU uses dedicated VRAM
+    // 50% of usable memory, clamped [64MB, 512MB]
+    uint64_t usableMem = g_gpuInfo.dedicatedVRAM;
+    if (g_gpuInfo.isIntegrated && g_gpuInfo.sharedMemory > usableMem)
+        usableMem = g_gpuInfo.sharedMemory;
+    uint64_t halfMem = usableMem / 2;
+    if (halfMem < 64 * 1024 * 1024) halfMem = 64 * 1024 * 1024;
+    if (halfMem > 512 * 1024 * 1024) halfMem = 512 * 1024 * 1024;
+    g_maxPoolMemBytes = halfMem;
     
     return true;
 }
@@ -159,15 +163,17 @@ struct GPUBuffer {
 std::unordered_map<uint32_t, std::vector<GPUBuffer*>> g_bufferPool;
 std::unordered_map<uint32_t, std::vector<ID3D11Buffer*>> g_stagingPool;
 
-// Size-aware pool limits based on GPU's dedicated VRAM
-// Huge buffers (>= VRAM/4) are never pooled — they'd cause VRAM thrashing on iGPUs
+// Size-aware pool limits based on GPU's usable memory
+// Old engine used flat max=8 for all sizes; we use similar generous limits.
 static inline size_t MaxPoolForSize(uint32_t count) {
     size_t bytes = (size_t)count * sizeof(float);
-    uint64_t vram = g_gpuInfo.dedicatedVRAM;
-    // On iGPU with small VRAM, be very conservative with large buffers
-    if (vram > 0 && bytes >= vram / 4) return 0;  // never pool (e.g., >= 32MB on 128MB iGPU)
-    if (bytes >= 4 * 1024 * 1024)    return 1;   // >= 4MB: only 1 copy
-    if (bytes >= 256 * 1024)          return 4;   // >= 256KB: moderate
+    // iGPUs allocate from shared system memory — use that for pool sizing
+    uint64_t usableMem = g_gpuInfo.dedicatedVRAM;
+    if (g_gpuInfo.isIntegrated && g_gpuInfo.sharedMemory > usableMem)
+        usableMem = g_gpuInfo.sharedMemory;
+    if (usableMem > 0 && bytes >= usableMem / 4) return 4;  // truly huge: 4 copies
+    if (bytes >= 4 * 1024 * 1024)    return 6;   // >= 4MB: generous
+    if (bytes >= 256 * 1024)          return 8;   // >= 256KB: same as old
     return 16;                                     // < 256KB: aggressive
 }
 static uint64_t g_poolHits = 0;
@@ -244,7 +250,9 @@ static inline void ReleaseBufferInternal(GPUBuffer* b) {
     auto& pool = g_bufferPool[b->size];
     size_t maxPool = MaxPoolForSize(b->size);
     size_t bufBytes = (size_t)b->size * sizeof(float);
-    if (pool.size() < maxPool && g_poolMemBytes + bufBytes <= g_maxPoolMemBytes) {
+    // Only enforce per-size limit (no global cap — matches old engine behavior).
+    // D3D11 driver manages actual memory placement; pool just holds handles for reuse.
+    if (pool.size() < maxPool) {
         pool.push_back(b);
         g_poolMemBytes += bufBytes;
     } else {

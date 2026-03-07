@@ -2,9 +2,9 @@
 // Best config for Intel Xe:
 //   - 16 accumulators (no register spilling on 128 GRFs)
 //   - Transposed tileA with +1 padding for bank-conflict-free shared mem
-//   - Register prefetching: next tile loaded while current is computed
-//   - K_STEP=32: warp-aligned for fully coalesced global loads
-//   - 16KB shared memory (good occupancy: 3-4 workgroups per subslice)
+//   - Register prefetching: load next tile from global while computing current
+//   - K_STEP=32: 512 FMAs per thread per tile, 8 loads per thread
+//   - ~16KB shared memory (good occupancy: 3-4 workgroups per subslice)
 
 cbuffer Params : register(b0) { 
     uint M, K, N, flags; 
@@ -17,7 +17,7 @@ RWStructuredBuffer<float> C : register(u0);
 #define DIM 16
 #define WPT 4
 #define K_STEP 32
-#define NLD 8   // TS * K_STEP / (DIM*DIM) = 64*32/256 = 8
+#define NLD 8       // loads per thread = TS * K_STEP / (DIM*DIM) = 64*32/256
 
 groupshared float tileA_T[K_STEP][TS + 1];  // +1 pad: stride 65 breaks bank alignment
 groupshared float tileB[K_STEP][TS];
@@ -51,7 +51,7 @@ void CSMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // ── Main loop with register prefetching ──
+    // ── Main loop: prefetch next tile → compute current → writeback ──
     for (uint t = 0; t < numTiles; ++t) {
         float pA[NLD], pB[NLD];
         const bool more = (t + 1 < numTiles);
@@ -99,6 +99,7 @@ void CSMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
+    // ── Store results ──
     [unroll] for (uint r = 0; r < WPT; ++r) {
         [unroll] for (uint c = 0; c < WPT; ++c) {
             uint gR = gid.y * TS + ty + r * DIM;
