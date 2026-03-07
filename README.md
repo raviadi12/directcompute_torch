@@ -85,6 +85,7 @@ Current layers:
 
 - `Linear`
 - `ConvLayer`
+- `BatchNorm2d`
 - `maxpool2d`
 - `flatten`
 
@@ -96,13 +97,16 @@ Current activations and losses:
 Current optimizers:
 
 - `SGD`
+- `Adam`
+- `AdamW`
+- `Muon`
 
 Current model utilities:
 
 - `Model.parameters()`
 - `Model.export()`
+- `ONNXModel`
 - `Metrics`
-- `ReusableTensor`
 
 ## If You Want To Build From GitHub
 
