@@ -87,6 +87,31 @@ class AlexNet(Model):
         return self.fc(flatten(x))
 ```
 
+[See how to train AlexNet models with this](https://github.com/raviadi12/directcompute_torch/blob/main/train_alexnet.py)
+
+## API Support
+
+### Layers
+- **Linear**: Fully-connected dense layer.
+- **ConvLayer**: 2D Convolutional layer with im2col/matmul optimization.
+- **BatchNorm2d**: Standard batch normalization for training and inference.
+- **MaxPool2d**: Spatial max pooling.
+- **Flatten**: Reshapes multidimensional input to flat vector.
+
+### Optimizers
+- **SGD**: Classic Stochastic Gradient Descent with gradient clipping.
+- **Adam**: Adaptive Moment Estimation with GPU-optimized momentum.
+- **AdamW**: Adam with weight decay decoupling (SOTA for many vision/LLM tasks).
+- **Muon**: Orthogonal Gradient Newton-Schulz iteration (extreme training efficiency).
+
+### Functions & Activations
+- **relu**: Rectified Linear Unit.
+- **softmax_ce**: Softmax + Cross-Entropy loss combined (numerical stability).
+- **matmul**: Matrix multiplication with optional `transA` and `transB` flags.
+- **scale_add**: Scaled element-wise addition.
+- **rms**: Root Mean Square calculation on GPU.
+
+
 ## Contributing and Source Code
 
 For the full source code, C++ engine implementation, and detailed architecture documentation, please visit our GitHub repository:
