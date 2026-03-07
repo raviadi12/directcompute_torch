@@ -85,13 +85,17 @@ Current layers:
 
 - `Linear`
 - `ConvLayer`
+- `DepthwiseConvLayer` — depthwise separable convolution (MobileNet-style)
 - `BatchNorm2d`
 - `maxpool2d`
+- `global_avg_pool2d` — global average pooling (needed for ResNet/MobileNet heads)
 - `flatten`
 
 Current activations and losses:
 
 - `relu`
+- `relu6` — clamped ReLU used in MobileNetV2
+- `add` — differentiable element-wise add (skip connections / residual blocks)
 - `softmax_ce`
 
 Current optimizers:
@@ -107,6 +111,31 @@ Current model utilities:
 - `Model.export()`
 - `ONNXModel`
 - `Metrics`
+
+### Transfer Learning Example
+
+The engine can load pretrained ImageNet weights and run feature extraction. See [`train_petnet_transfer.py`](train_petnet_transfer.py) for a complete example that:
+
+1. Downloads MobileNetV2 pretrained weights from torchvision (once, via `download_mobilenet.py`)
+2. Freezes the backbone — Conv2D automatically skips im2col allocation when `requires_grad=False`, saving GPU memory
+3. Extracts 1280-dim features once for all images
+4. Trains a linear classifier on the cached features
+5. Evaluates on a held-out unseen test set
+
+```
+python download_mobilenet.py   # requires torch, one-time download
+python train_petnet_transfer.py
+```
+
+Results on PetImages (Cat vs Dog), 400 unseen test images, Intel Xe iGPU:
+
+| Phase | Time |
+|-------|------|
+| Feature extraction (1600 images) | 41.7s |
+| Classifier training (30 epochs) | 0.9s |
+| **Total** | **42.7s** |
+
+**Test accuracy: 98.2%** — matching PyTorch CPU (43.1s, 98.0%) while running on a 128MB iGPU.
 
 ## Contributing from GitHub
 
@@ -134,7 +163,7 @@ HLSL Compute Shaders (nn_*.hlsl)  ←  GPU kernels for every operation
 | Component | File | Role |
 |-----------|------|------|
 | **Runtime** | `engine.cpp` → `engine.dll` | D3D11 device init, buffer create/read/release, shader compile & dispatch |
-| **Framework** | `nn_engine.py` | Tensor class, autograd (topological backward), layers (Linear, ConvLayer, MaxPool2D, Flatten), SGD optimizer |
+| **Framework** | `nn_engine.py` | Tensor class, autograd (topological backward), layers (Linear, ConvLayer, DepthwiseConvLayer, MaxPool2D, GlobalAvgPool2D, BatchNorm2d, Flatten), optimizers (SGD, Adam, AdamW, Muon) |
 | **Training scripts** | `train_lenet.py`, `train_alexnet.py` | End-to-end training loops with validation |
 | **Shaders** | `nn_*.hlsl` | One HLSL file per GPU kernel (see full list below) |
 
@@ -312,9 +341,12 @@ The Python helper `_run_mm()` automatically selects the shader based on matrix d
 |--------|---------|
 | `nn_relu.hlsl` | ReLU forward: `max(0, x)` |
 | `nn_relu_grad.hlsl` | ReLU backward: `grad * (x > 0)` |
+| `nn_relu6.hlsl` | ReLU6 forward: `min(max(0, x), 6)` |
+| `nn_relu6_grad.hlsl` | ReLU6 backward: `grad * (0 < x < 6)` |
 | `nn_softmax.hlsl` | Numerically stable softmax (per-row max subtraction) |
 | `nn_softmax_ce_grad.hlsl` | Combined softmax + cross-entropy gradient: `softmax - one_hot` |
 | `nn_loss.hlsl` | Cross-entropy loss computation |
+| `nn_add.hlsl` | Element-wise add for differentiable skip connections |
 
 ### Pooling Shaders
 
@@ -322,6 +354,16 @@ The Python helper `_run_mm()` automatically selects the shader based on matrix d
 |--------|---------|
 | `nn_maxpool_forward.hlsl` | Max pooling with index tracking (stores argmax for backward) |
 | `nn_maxpool_backward.hlsl` | Scatter gradients to max positions using saved indices |
+| `nn_global_avg_pool.hlsl` | Global average pooling: mean over H×W → (N, C) |
+| `nn_global_avg_pool_backward.hlsl` | Broadcast gradient back to H×W |
+
+### Depthwise Convolution Shaders
+
+| Shader | Purpose |
+|--------|---------|
+| `nn_depthwise_conv_forward.hlsl` | Depthwise conv forward: one filter per channel |
+| `nn_depthwise_conv_backward_input.hlsl` | Depthwise conv input gradient |
+| `nn_depthwise_conv_backward_filter.hlsl` | Depthwise conv filter gradient |
 
 ### Utility Shaders
 
@@ -402,12 +444,15 @@ Each `RunShader()` call ends with `g_context->Flush()`. While counter-intuitive 
 ## File Structure
 
 ```
-engine.cpp              # D3D11 compute shader runtime (→ engine.dll)
-compile_engine.bat      # Build script for engine.dll
-nn_engine.py            # Python autograd framework + ctypes bindings
-train_lenet.py          # LeNet-5 on MNIST (1→6→16 conv, 256→120→84→10 FC)
-train_alexnet.py        # AlexNet on PetImages (5 conv layers, 3 FC layers)
-nn_*.hlsl               # HLSL compute shaders (one per operation)
-mnist/                  # MNIST digit images (0-9 subfolders)
-PetImages/              # Cat/Dog image dataset
+engine.cpp                     # D3D11 compute shader runtime (→ engine.dll)
+compile_engine.bat             # Build script for engine.dll
+nn_engine.py                   # Python autograd framework + ctypes bindings
+train_lenet.py                 # LeNet-5 on MNIST
+train_alexnet.py               # AlexNet on PetImages
+train_petnet_transfer.py       # MobileNetV2 transfer learning on PetImages
+download_mobilenet.py          # Download pretrained MobileNetV2 weights (requires torch, once)
+train_petnet_transfer_pytorch.py  # PyTorch equivalent for benchmarking
+nn_*.hlsl                      # HLSL compute shaders (one per operation)
+mnist/                         # MNIST digit images (0-9 subfolders)
+PetImages/                     # Cat/Dog image dataset
 ```

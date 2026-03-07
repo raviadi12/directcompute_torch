@@ -1,5 +1,6 @@
 LICENSE
 MANIFEST.in
+PYPI_README.md
 README.md
 compile_engine.bat
 engine.cpp

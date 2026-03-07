@@ -114,7 +114,7 @@ def train_alexnet():
             step_count += 1
             if step_count % accum_steps == 0 or end >= len(X_train):
                 optimizer.step(clip=1.0)
-            end_batch()
+                end_batch()
 
         train_loss, train_acc = metrics.collect(len(X_train))
 

@@ -144,7 +144,10 @@ shaders = ["matmul_universal", "matmul_coarsened", "add_bias", "relu", "relu_gra
            "argmax_correct", "accumulate_scalar",
            "bias_relu", "conv_grad_reshape_relu",
            "batchnorm_mean_var", "batchnorm_forward", "batchnorm_backward_reduce", "batchnorm_backward_dx",
-           "adam", "scale_add", "rms"]
+           "adam", "scale_add", "rms",
+           "depthwise_conv_forward", "depthwise_conv_backward_input", "depthwise_conv_backward_filter",
+           "global_avg_pool", "global_avg_pool_backward", "add",
+           "relu6", "relu6_grad"]
 for s in shaders:
     lib.CompileShader(s.encode(), _find_resource(f"nn_{s}.hlsl"))
 
@@ -467,7 +470,7 @@ class Tensor:
             children_done = True
             if v._ctx:
                 for i in v._ctx.inputs:
-                    if isinstance(i, Tensor) and i not in visited:
+                    if isinstance(i, Tensor) and i.requires_grad and i not in visited:
                         stack.append(i)
                         children_done = False
             if children_done:
@@ -475,10 +478,10 @@ class Tensor:
                 stack.pop()
                 topo.append(v)
         for v in reversed(topo):
-            if v._ctx: v._ctx.backward(v.grad)
+            if v._ctx and v.grad is not None: v._ctx.backward(v.grad)
 
     def _accumulate_grad(self, grad):
-        if self.grad is None:
+        if self.grad is None or self.grad.gpu_buf is None:
             self.grad = grad
         else:
             _dispatch(b"grad_accum", (grad.gpu_buf,), (self.grad.gpu_buf,),
@@ -554,16 +557,23 @@ class Conv2D(Function):
         outH = (inH + 2 * padding - kH) // stride + 1
         outW = (inW + 2 * padding - kW) // stride + 1
 
-        pIm2col = ctypes.c_void_p()
-        out_handle = lib.ConvForwardFused(
-            x.gpu_buf, filters.gpu_buf, bias.gpu_buf,
-            batch, inC, inH, inW, outC, kH, kW,
-            stride, padding, actType, ctypes.byref(pIm2col))
-        self.im2col_handle = pIm2col.value
+        needs_backward = x.requires_grad or filters.requires_grad or bias.requires_grad
+        if needs_backward:
+            pIm2col = ctypes.c_void_p()
+            out_handle = lib.ConvForwardFused(
+                x.gpu_buf, filters.gpu_buf, bias.gpu_buf,
+                batch, inC, inH, inW, outC, kH, kW,
+                stride, padding, actType, ctypes.byref(pIm2col))
+            self.im2col_handle = pIm2col.value
+        else:
+            out_handle = lib.ConvForwardFused(
+                x.gpu_buf, filters.gpu_buf, bias.gpu_buf,
+                batch, inC, inH, inW, outC, kH, kW,
+                stride, padding, actType, None)
+            self.im2col_handle = None
 
-        res = Tensor.from_gpu(out_handle, (batch, outC, outH, outW),
-                              requires_grad=x.requires_grad or filters.requires_grad or bias.requires_grad)
-        self.fwd_output = res if actType != 0 else None
+        res = Tensor.from_gpu(out_handle, (batch, outC, outH, outW), requires_grad=needs_backward)
+        self.fwd_output = res if actType != 0 and needs_backward else None
         res._ctx = self
         return res
 
@@ -704,6 +714,23 @@ class ReLUFunc(Function):
                       (x.size+255)//256, 1, 1, u1=x.size)
             x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
 
+class ReLU6Func(Function):
+    def forward(self, x):
+        self.inputs = (x,)
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"relu6", (x.gpu_buf,), (out_handle,),
+                  (x.size+255)//256, 1, 1, u1=x.size)
+        res = Tensor.from_gpu(out_handle, x.shape, requires_grad=x.requires_grad)
+        res._ctx = self
+        return res
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            out_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"relu6_grad", (grad_output.gpu_buf, x.gpu_buf), (out_handle,),
+                      (x.size+255)//256, 1, 1, u1=x.size)
+            x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
+
 class SoftmaxCEFunc(Function):
     def forward(self, x, labels):
         self.inputs = (x, labels)
@@ -730,6 +757,7 @@ def matmul(A, B, transA=False, transB=False): return MatMul().forward(A, B, tran
 def add_bias(A, B): return AddBias().forward(A, B)
 def bias_relu(A, B): return BiasReLUFunc().forward(A, B)
 def relu(x): return ReLUFunc().forward(x)
+def relu6(x): return ReLU6Func().forward(x)
 def softmax_ce(x, labels): return SoftmaxCEFunc().forward(x, labels)
 def conv2d(x, f, b, stride=1, padding=0, actType=0): return Conv2D().forward(x, f, b, stride, padding, actType)
 def maxpool2d(x, pool_size=2, stride=2): return MaxPool2D().forward(x, pool_size, stride)
@@ -742,6 +770,121 @@ def scale_add(A, B, alpha=1.0, beta=1.0):
               u1=A.size, u2=float_to_uint(alpha), u3=float_to_uint(beta), cbSize=16)
     res = Tensor.from_gpu(out_handle, A.shape, track=True)
     return res
+
+# ── Differentiable Element-wise Add (skip / residual connections) ────────────
+
+class AddFunc(Function):
+    def forward(self, A, B):
+        self.inputs = (A, B)
+        out_handle = lib.CreateBuffer(None, A.size)
+        M_N = A.size
+        _dispatch(b"add", (A.gpu_buf, B.gpu_buf), (out_handle,),
+                  (M_N + 255) // 256, 1, 1, u1=M_N, u2=1)
+        res = Tensor.from_gpu(out_handle, A.shape,
+                              requires_grad=A.requires_grad or B.requires_grad)
+        res._ctx = self
+        return res
+    def backward(self, grad_output):
+        A, B = self.inputs
+        if A.requires_grad:
+            lib.AddRefBuffer(grad_output.gpu_buf)
+            A._accumulate_grad(Tensor.from_gpu(grad_output.gpu_buf, A.shape, track=False))
+        if B.requires_grad:
+            lib.AddRefBuffer(grad_output.gpu_buf)
+            B._accumulate_grad(Tensor.from_gpu(grad_output.gpu_buf, B.shape, track=False))
+
+def add(A, B): return AddFunc().forward(A, B)
+
+# ── Depthwise Conv2d ─────────────────────────────────────────────────────────
+
+class DepthwiseConv2DFunc(Function):
+    def forward(self, x, filters, bias, stride=1, padding=0):
+        self.inputs = (x, filters, bias)
+        self.stride, self.padding = stride, padding
+        batch, C, inH, inW = x.shape
+        _, _, kH, kW = filters.shape
+        outH = (inH + 2 * padding - kH) // stride + 1
+        outW = (inW + 2 * padding - kW) // stride + 1
+        out_size = batch * C * outH * outW
+
+        out_handle = lib.CreateBuffer(None, out_size)
+        _dispatch(b"depthwise_conv_forward",
+                  (x.gpu_buf, filters.gpu_buf, bias.gpu_buf), (out_handle,),
+                  (out_size + 255) // 256, 1, 1,
+                  u1=batch, u2=C, u3=inH, u4=inW,
+                  u5=kH, u6=kW, u7=stride, u8=padding, u9=outH,
+                  cbSize=36)
+        res = Tensor.from_gpu(out_handle, (batch, C, outH, outW),
+                              requires_grad=x.requires_grad or filters.requires_grad or bias.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        x, filters, bias = self.inputs
+        batch, C, inH, inW = x.shape
+        _, _, kH, kW = filters.shape
+        outH = grad_output.shape[2]
+
+        # dx
+        if x.requires_grad:
+            dx_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"depthwise_conv_backward_input",
+                      (grad_output.gpu_buf, filters.gpu_buf), (dx_handle,),
+                      (x.size + 255) // 256, 1, 1,
+                      u1=batch, u2=C, u3=inH, u4=inW,
+                      u5=kH, u6=kW, u7=self.stride, u8=self.padding, u9=outH,
+                      cbSize=36)
+            x._accumulate_grad(Tensor.from_gpu(dx_handle, x.shape, track=True))
+
+        # dfilter + dbias (single dispatch)
+        if filters.requires_grad or bias.requires_grad:
+            df_handle = lib.CreateBuffer(None, filters.size)
+            db_handle = lib.CreateBuffer(None, bias.size)
+            _dispatch(b"depthwise_conv_backward_filter",
+                      (grad_output.gpu_buf, x.gpu_buf), (df_handle, db_handle),
+                      C, 1, 1,
+                      u1=batch, u2=C, u3=inH, u4=inW,
+                      u5=kH, u6=kW, u7=self.stride, u8=self.padding, u9=outH,
+                      cbSize=36)
+            if filters.requires_grad:
+                filters._accumulate_grad(Tensor.from_gpu(df_handle, filters.shape, track=True))
+            else:
+                lib.ReleaseBuffer(df_handle)
+            if bias.requires_grad:
+                bias._accumulate_grad(Tensor.from_gpu(db_handle, bias.shape, track=True))
+            else:
+                lib.ReleaseBuffer(db_handle)
+
+def depthwise_conv2d(x, f, b, stride=1, padding=0):
+    return DepthwiseConv2DFunc().forward(x, f, b, stride, padding)
+
+# ── Global Average Pooling ───────────────────────────────────────────────────
+
+class GlobalAvgPool2DFunc(Function):
+    def forward(self, x):
+        self.inputs = (x,)
+        batch, C, H, W = x.shape
+        self.S = H * W
+        out_handle = lib.CreateBuffer(None, batch * C)
+        _dispatch(b"global_avg_pool", (x.gpu_buf,), (out_handle,),
+                  batch * C, 1, 1,
+                  u1=batch, u2=C, u3=self.S)
+        res = Tensor.from_gpu(out_handle, (batch, C), requires_grad=x.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            dx_handle = lib.CreateBuffer(None, x.size)
+            batch, C = grad_output.shape
+            _dispatch(b"global_avg_pool_backward",
+                      (grad_output.gpu_buf,), (dx_handle,),
+                      (x.size + 255) // 256, 1, 1,
+                      u1=batch, u2=C, u3=self.S)
+            x._accumulate_grad(Tensor.from_gpu(dx_handle, x.shape, track=True))
+
+def global_avg_pool2d(x): return GlobalAvgPool2DFunc().forward(x)
 
 def rms(A):
     out_handle = lib.CreateBuffer(None, 1)
@@ -851,6 +994,17 @@ class ConvLayer:
         act = 1 if relu else actType
         return conv2d(x, self.filters, self.bias, self.stride, self.padding, act)
 
+class DepthwiseConvLayer:
+    """Depthwise convolution: one filter per input channel.
+    filters shape: (C, 1, kH, kW), bias shape: (C,)"""
+    def __init__(self, channels, ks, stride=1, padding=0):
+        limit = np.sqrt(6 / (ks * ks * 2))
+        self.filters = Tensor(np.random.uniform(-limit, limit, (channels, 1, ks, ks)), requires_grad=True, track=False)
+        self.bias = Tensor(np.zeros(channels), requires_grad=True, track=False)
+        self.stride, self.padding = stride, padding
+    def __call__(self, x):
+        return depthwise_conv2d(x, self.filters, self.bias, self.stride, self.padding)
+
 class BatchNorm2d:
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         self.num_features = num_features
@@ -893,11 +1047,11 @@ class Model:
         raise NotImplementedError
 
     def parameters(self):
-        """Auto-discover all trainable parameters from ConvLayer and Linear attributes."""
+        """Auto-discover all trainable parameters from ConvLayer, DepthwiseConvLayer, Linear, and BatchNorm2d attributes."""
         params = []
         for name in dir(self):
             attr = getattr(self, name)
-            if isinstance(attr, ConvLayer):
+            if isinstance(attr, (ConvLayer, DepthwiseConvLayer)):
                 params.extend([attr.filters, attr.bias])
             elif isinstance(attr, Linear):
                 params.extend([attr.w, attr.b])
@@ -919,7 +1073,7 @@ class Model:
         layers = []
         for name in sorted(dir(self)):
             attr = getattr(self, name)
-            if isinstance(attr, (ConvLayer, Linear)):
+            if isinstance(attr, (ConvLayer, DepthwiseConvLayer, Linear)):
                 layers.append((name, attr))
         return layers
 
@@ -1175,8 +1329,8 @@ class AdamW:
             )
 
 class Adam(AdamW):
-    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
-        super().__init__(params, lr, betas, eps, weight_decay=0.0)
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        super().__init__(params, lr, betas, eps, weight_decay=weight_decay)
 
 class Muon:
     def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.01, ns_steps=5):
