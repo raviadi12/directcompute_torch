@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "directcompute-nn"
-version = "0.1.5"
+version = "0.1.6"
 description = "Windows-only GPU neural network training via DirectCompute (D3D11 Compute Shaders)"
-readme = "README.md"
+readme = "PYPI_README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [

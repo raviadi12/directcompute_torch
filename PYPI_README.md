@@ -1,0 +1,101 @@
+# DirectCompute Neural Network Engine
+
+A high-performance, from-scratch neural network training framework that runs entirely on the GPU using **DirectCompute (D3D11 Compute Shaders)**. No CUDA, no cuDNN — just raw HLSL shaders dispatched through a thin C++ runtime, driven from Python.
+
+## Quick Install (Windows Only)
+
+```bash
+pip install directcompute-nn
+```
+
+The Windows wheel includes everything: pre-compiled `engine.dll`, bundled HLSL shaders, and the Python API. No C++ compiler is required to start using it.
+
+## Key Features
+
+- **Pure DirectCompute**: Uses standard D3D11 compute shaders (HLSL).
+- **Fast Autograd**: Python-based automatic differentiation with GPU-accelerated gradient accumulation.
+- **Modern Optimizers**: Support for **SGD**, **Adam**, **AdamW**, and the state-of-the-art **Muon** optimizer.
+- **Advanced Layers**: Convolutional layers, Linear/Dense, **BatchNorm2d**, MaxPool, and more.
+- **ONNX Inference**: Load and run ONNX models directly on the DirectCompute engine.
+
+## Usage Examples
+
+### 1. Minimal Forward Pass
+```python
+import numpy as np
+from nn_engine import Tensor, Linear, relu
+
+# Data automatically moves to GPU
+x = Tensor(np.random.randn(32, 128).astype(np.float32))
+layer = Linear(128, 64)
+y = relu(layer(x))
+
+print(y.shape)  # (32, 64)
+```
+
+### 2. Standard Training (LeNet)
+```python
+from nn_engine import ConvLayer, Linear, Model, maxpool2d, flatten, relu, Adam
+
+class LeNet(Model):
+    def __init__(self):
+        super().__init__()
+        self.c1 = ConvLayer(1, 6, 5)
+        self.c2 = ConvLayer(6, 16, 5)
+        self.l1 = Linear(16*4*4, 120)
+        self.l2 = Linear(120, 84)
+        self.l3 = Linear(84, 10)
+
+    def forward(self, x):
+        x = maxpool2d(relu(self.c1(x)))
+        x = maxpool2d(relu(self.c2(x)))
+        x = flatten(x)
+        x = relu(self.l1(x))
+        x = relu(self.l2(x))
+        return self.l3(x)
+
+model = LeNet()
+optimizer = Adam(model.parameters(), lr=0.001)
+
+# Standard training loop...
+# loss = softmax_ce(model(xb), yb)
+# loss.backward()
+# optimizer.step()
+```
+
+### 3. Large Model (AlexNet)
+The engine is capable of running larger architectures like AlexNet. You can use global pooling to handle multiple image sizes.
+```python
+from nn_engine import ConvLayer, Linear, Model, maxpool2d, flatten
+
+class AlexNet(Model):
+    def __init__(self, num_classes=1000):
+        super().__init__()
+        self.c1 = ConvLayer(3, 64, 11, stride=4, padding=2)
+        self.c2 = ConvLayer(64, 192, 5, padding=2)
+        self.c3 = ConvLayer(192, 384, 3, padding=1)
+        self.c4 = ConvLayer(384, 256, 3, padding=1)
+        self.c5 = ConvLayer(256, 256, 3, padding=1)
+        self.fc = Linear(256 * 6 * 6, num_classes)
+
+    def forward(self, x):
+        x = maxpool2d(relu(self.c1(x)), pool_size=3, stride=2)
+        x = maxpool2d(relu(self.c2(x)), pool_size=3, stride=2)
+        x = relu(self.c3(x))
+        x = relu(self.c4(x))
+        x = maxpool2d(relu(self.c5(x)), pool_size=3, stride=2)
+        return self.fc(flatten(x))
+```
+
+## Contributing and Source Code
+
+For the full source code, C++ engine implementation, and detailed architecture documentation, please visit our GitHub repository:
+
+**[https://github.com/raviadi12/directcompute_torch](https://github.com/raviadi12/directcompute_torch)**
+
+## Future Roadmap
+
+- **Vulkan & DX12 Backends**: Cross-platform GPU support and lower-level control.
+- **Enhanced Memory Management**: Improved DMA copies and UMA (Unified Memory Architecture) optimizations for integrated GPUs.
+- **Expanded Op Library**: More activation functions, Dropout, and Transposed Convolutions.
+- **Deployment**: Enhanced ONNX support for both export and import.

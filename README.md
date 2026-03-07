@@ -108,9 +108,14 @@ Current model utilities:
 - `ONNXModel`
 - `Metrics`
 
-## If You Want To Build From GitHub
+## Contributing from GitHub
 
-Use this path if you want to work on the engine itself, modify shaders, or rebuild the DLL locally.
+We welcome contributions! If you want to work on the engine itself, modify shaders, or optimize the C++ runtime:
+
+1.  **Clone the Repo**: `git clone https://github.com/raviadi12/directcompute_torch.git`
+2.  **Environment**: Ensure you have the [Build Prerequisites](#build-prerequisites) for C++ compilation.
+3.  **Refactor & PR**: Feel free to submit Pull Requests for new layers, optimized kernels, or bug fixes.
+4.  **Issue Tracking**: Report any DirectCompute-specific driver issues or performance regressions in the Issues tab.
 
 ## Architecture Overview
 
@@ -185,11 +190,11 @@ Expects `PetImages/Cat/` and `PetImages/Dog/` folders containing JPEG images (re
 
 ## Future Work
 
-- DirectX 12 backend
-- Vulkan backend
-- More optimizers beyond `SGD`
-- More activations and layers
-- Better packaging for examples and pretrained models
+- **Higher-Level Backends**: Implement **Vulkan** and **DirectX 12** backends for cross-platform support and better multi-queue orchestration.
+- **Unified Memory Architecture (UMA) Optimizations**: Tailored memory mapping and `memcpy` paths for integrated GPUs (iGPUs) to minimize staging buffer overhead.
+- **Sparse Operations**: GPU Kernels for sparse matrix computations and efficient pruning techniques.
+- **Advanced ONNX Compatibility**: Full-scale ONNX graph importing and optimized deployment paths.
+- **Fused Operators**: More fused HLSL kernels (e.g., Fused Conv-BN-ReLU) to reduce dispatch-bound bottlenecks.
 
 ## How the Engine Works
 
