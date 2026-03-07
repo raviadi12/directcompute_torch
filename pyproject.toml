@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "directcompute-nn"
+version = "0.1.4"
+description = "Windows-only GPU neural network training via DirectCompute (D3D11 Compute Shaders)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "Pillow>=9.0",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+keywords = ["directcompute", "d3d11", "gpu", "neural-network", "windows", "onnx"]
+
+[project.optional-dependencies]
+onnx = ["onnx>=1.14"]
+
+[project.urls]
+Homepage = "https://github.com/raviadi12/directcompute_torch"
+Repository = "https://github.com/raviadi12/directcompute_torch"
+
+[tool.setuptools]
+py-modules = ["nn_engine", "export_onnx"]
+packages = ["directcompute_nn"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+directcompute_nn = ["nn_*.hlsl", "engine.dll", "compile_engine.bat"]

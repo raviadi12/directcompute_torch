@@ -2,7 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 import time
-from nn_engine import (Tensor, Linear, ConvLayer, SGD, Metrics,
+from nn_engine import (Tensor, Linear, ConvLayer, Model, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
                        bias_relu, get_pool_stats, get_pool_memory)
 
@@ -23,6 +23,47 @@ def load_pets(limit_per_class=100, size=224):
                 continue
     return np.array(images), np.array(labels)
 
+class AlexNet(Model):
+    def __init__(self):
+        super().__init__()
+        self.c1 = ConvLayer(3, 64, 11, stride=4, padding=2)
+        self.c2 = ConvLayer(64, 192, 5, padding=2)
+        self.c3 = ConvLayer(192, 384, 3, padding=1)
+        self.c4 = ConvLayer(384, 256, 3, padding=1)
+        self.c5 = ConvLayer(256, 256, 3, padding=1)
+        self.l1 = Linear(256 * 6 * 6, 512)
+        self.l2 = Linear(512, 512)
+        self.l3 = Linear(512, 2)
+
+    def forward(self, xb):
+        x = self.c1(xb, relu=True)
+        x = maxpool2d(x, pool_size=3, stride=2)
+        x = self.c2(x, relu=True)
+        x = maxpool2d(x, pool_size=3, stride=2)
+        x = self.c3(x, relu=True)
+        x = self.c4(x, relu=True)
+        x = self.c5(x, relu=True)
+        x = maxpool2d(x, pool_size=3, stride=2)
+        x = flatten(x)
+        x = self.l1(x, relu=True)
+        x = self.l2(x, relu=True)
+        return self.l3(x)
+
+    def _onnx_graph(self, input_shape, helper, TensorProto, numpy_helper):
+        nodes, initializers = [], []
+        h = Model._conv_onnx
+        g = Model._linear_onnx
+        h(self.c1, "c1", "input", "pool1", helper, numpy_helper, initializers, nodes, with_relu=True, pool=(3, 2))
+        h(self.c2, "c2", "pool1", "pool2", helper, numpy_helper, initializers, nodes, with_relu=True, pool=(3, 2))
+        h(self.c3, "c3", "pool2", "c3_out", helper, numpy_helper, initializers, nodes, with_relu=True)
+        h(self.c4, "c4", "c3_out", "c4_out", helper, numpy_helper, initializers, nodes, with_relu=True)
+        h(self.c5, "c5", "c4_out", "pool5", helper, numpy_helper, initializers, nodes, with_relu=True, pool=(3, 2))
+        nodes.append(helper.make_node("Flatten", ["pool5"], ["flat"], axis=1))
+        g(self.l1, "l1", "flat", "fc1", helper, numpy_helper, initializers, nodes, with_relu=True)
+        g(self.l2, "l2", "fc1", "fc2", helper, numpy_helper, initializers, nodes, with_relu=True)
+        g(self.l3, "l3", "fc2", "output", helper, numpy_helper, initializers, nodes)
+        return nodes, initializers, "output", [1, 2]
+
 def train_alexnet():
     X, Y = load_pets(limit_per_class=2000)
     idx = np.arange(len(X)); np.random.shuffle(idx); X, Y = X[idx], Y[idx]
@@ -31,19 +72,8 @@ def train_alexnet():
     Y_train, Y_val = Y[:split], Y[split:]
     print(f"Dataset Split: Train={len(X_train)}, Val={len(X_val)}")
 
-    # AlexNet Architecture
-    c1 = ConvLayer(3, 64, 11, stride=4, padding=2)
-    c2 = ConvLayer(64, 192, 5, padding=2)
-    c3 = ConvLayer(192, 384, 3, padding=1)
-    c4 = ConvLayer(384, 256, 3, padding=1)
-    c5 = ConvLayer(256, 256, 3, padding=1)
-    l1 = Linear(256 * 6 * 6, 512)
-    l2 = Linear(512, 512)
-    l3 = Linear(512, 2)
-
-    params = [c1.filters, c1.bias, c2.filters, c2.bias, c3.filters, c3.bias,
-              c4.filters, c4.bias, c5.filters, c5.bias,
-              l1.w, l1.b, l2.w, l2.b, l3.w, l3.b]
+    model = AlexNet()
+    params = model.parameters()
     optimizer = SGD(params, lr=0.01)
     metrics = Metrics()
 
@@ -52,22 +82,10 @@ def train_alexnet():
     epochs = 50
 
     def forward(xb):
-        x = c1(xb, relu=True)
-        x = maxpool2d(x, pool_size=3, stride=2)
-        x = c2(x, relu=True)
-        x = maxpool2d(x, pool_size=3, stride=2)
-        x = c3(x, relu=True)
-        x = c4(x, relu=True)
-        x = c5(x, relu=True)
-        x = maxpool2d(x, pool_size=3, stride=2)
-        x = flatten(x)
-        x = l1(x, relu=True)
-        x = l2(x, relu=True)
-        return l3(x)
+        return model(xb)
 
     # AlexNet creates huge intermediate buffers (im2col > 60MB each).
-    # On iGPU (128MB dedicated VRAM): flush every batch, no pool warming,
-    # no ReusableTensor — keep VRAM free for active compute.
+    # On iGPU (128MB dedicated VRAM): flush every batch, no pool warming.
     end_batch.flush_interval = 1
 
     print(f"\nStarting AlexNet training on DirectCompute GPU...")
@@ -121,6 +139,9 @@ def train_alexnet():
     pool_mb = get_pool_memory() / (1024*1024)
     print(f"Total AlexNet DirectCompute Training Time: {total:.2f}s")
     print(f"Pool stats: {hits} hits, {misses} misses, {pool_mb:.1f}MB pooled")
+
+    # ONNX export
+    model.export("alexnet.onnx", input_shape=[1, 3, 224, 224])
 
 if __name__ == "__main__":
     train_alexnet()

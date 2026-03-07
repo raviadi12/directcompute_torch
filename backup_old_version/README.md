@@ -2,112 +2,6 @@
 
 A from-scratch neural network training framework that runs entirely on the GPU using **DirectCompute (D3D11 Compute Shaders)**. No CUDA, no cuDNN — just raw HLSL shaders dispatched through a thin C++ runtime, driven from Python via ctypes.
 
-## Platform Support
-
-This project currently works on **Windows only**.
-
-Reason: the runtime is built on **DirectCompute / Direct3D 11**, which is part of the Windows graphics stack.
-
-If you need cross-platform support, that is future work.
-
-## How To Use
-
-If you want the ready-to-use version, install from PyPI on Windows:
-
-```bash
-pip install directcompute-nn
-```
-
-The Windows wheel already includes:
-
-- `engine.dll`
-- bundled `nn_*.hlsl` shaders
-- the Python runtime API
-
-So you can use the engine immediately without compiling C++.
-
-### Quick Example
-
-```python
-import numpy as np
-from nn_engine import Tensor, Linear, relu
-
-x = Tensor(np.random.randn(32, 128).astype(np.float32))
-layer = Linear(128, 64)
-y = relu(layer(x))
-
-print(y.shape)  # (32, 64)
-```
-
-### Train And Export Example
-
-```python
-from nn_engine import ConvLayer, Linear, Model, maxpool2d, flatten
-
-class LeNet(Model):
-    def __init__(self):
-        super().__init__()
-        self.c1 = ConvLayer(1, 6, 5)
-        self.c2 = ConvLayer(6, 16, 5)
-        self.l1 = Linear(16*4*4, 120)
-        self.l2 = Linear(120, 84)
-        self.l3 = Linear(84, 10)
-
-    def forward(self, x):
-        x = self.c1(x, relu=True)
-        x = maxpool2d(x)
-        x = self.c2(x, relu=True)
-        x = maxpool2d(x)
-        x = flatten(x)
-        x = self.l1(x, relu=True)
-        x = self.l2(x, relu=True)
-        return self.l3(x)
-
-    def _onnx_graph(self, input_shape, helper, TensorProto, numpy_helper):
-        nodes, initializers = [], []
-        h = Model._conv_onnx
-        g = Model._linear_onnx
-        h(self.c1, "c1", "input", "pool1", helper, numpy_helper, initializers, nodes, with_relu=True, pool=(2, 2))
-        h(self.c2, "c2", "pool1", "pool2", helper, numpy_helper, initializers, nodes, with_relu=True, pool=(2, 2))
-        nodes.append(helper.make_node("Flatten", ["pool2"], ["flat"], axis=1))
-        g(self.l1, "l1", "flat", "fc1", helper, numpy_helper, initializers, nodes, with_relu=True)
-        g(self.l2, "l2", "fc1", "fc2", helper, numpy_helper, initializers, nodes, with_relu=True)
-        g(self.l3, "l3", "fc2", "output", helper, numpy_helper, initializers, nodes)
-        return nodes, initializers, "output", [1, 10]
-
-model = LeNet()
-model.export("lenet.onnx", input_shape=[1, 1, 28, 28])
-```
-
-### Available API Surface
-
-Current layers:
-
-- `Linear`
-- `ConvLayer`
-- `maxpool2d`
-- `flatten`
-
-Current activations and losses:
-
-- `relu`
-- `softmax_ce`
-
-Current optimizers:
-
-- `SGD`
-
-Current model utilities:
-
-- `Model.parameters()`
-- `Model.export()`
-- `Metrics`
-- `ReusableTensor`
-
-## If You Want To Build From GitHub
-
-Use this path if you want to work on the engine itself, modify shaders, or rebuild the DLL locally.
-
 ## Architecture Overview
 
 ```
@@ -129,7 +23,7 @@ HLSL Compute Shaders (nn_*.hlsl)  ←  GPU kernels for every operation
 | **Training scripts** | `train_lenet.py`, `train_alexnet.py` | End-to-end training loops with validation |
 | **Shaders** | `nn_*.hlsl` | One HLSL file per GPU kernel (see full list below) |
 
-## Build Prerequisites
+## Prerequisites
 
 - **Windows 10/11** with a DirectX 11-capable GPU
 - **Visual Studio 2022+** (need `cl.exe` and `vcvarsall.bat` for compiling the DLL)
@@ -178,14 +72,6 @@ python train_alexnet.py
 ```
 
 Expects `PetImages/Cat/` and `PetImages/Dog/` folders containing JPEG images (resized to 224×224 at load time).
-
-## Future Work
-
-- DirectX 12 backend
-- Vulkan backend
-- More optimizers beyond `SGD`
-- More activations and layers
-- Better packaging for examples and pretrained models
 
 ## How the Engine Works
 

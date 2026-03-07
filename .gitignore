@@ -39,3 +39,11 @@ train_log.txt
 
 # Resolved docs
 *.md.resolved
+
+# Secrets
+pypitoken.txt
+*.token
+*.key
+
+# Models
+*.onnx

@@ -4,8 +4,7 @@ from PIL import Image
 import time
 from nn_engine import (Tensor, Linear, ConvLayer, Model, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
-                       bias_relu, auto_warm, get_pool_stats,
-                       BatchNorm2d)
+                       bias_relu, auto_warm, get_pool_stats)
 
 def load_mnist(limit_per_class=100):
     images, labels = [], []
@@ -17,24 +16,20 @@ def load_mnist(limit_per_class=100):
             labels.append(digit)
     return np.array(images), np.array(labels)
 
-class LeNet(Model):
+class LeNetNoBN(Model):
     def __init__(self):
         super().__init__()
         self.c1 = ConvLayer(1, 6, 5)
-        self.bn1 = BatchNorm2d(6)
         self.c2 = ConvLayer(6, 16, 5)
-        self.bn2 = BatchNorm2d(16)
         self.l1 = Linear(16*4*4, 120)
         self.l2 = Linear(120, 84)
         self.l3 = Linear(84, 10)
 
     def forward(self, xb):
         x = self.c1(xb)
-        x = self.bn1(x)
         x = relu(x)
         x = maxpool2d(x)
         x = self.c2(x)
-        x = self.bn2(x)
         x = relu(x)
         x = maxpool2d(x)
         x = flatten(x)
@@ -54,7 +49,7 @@ class LeNet(Model):
         g(self.l3, "l3", "fc2", "output", helper, numpy_helper, initializers, nodes)
         return nodes, initializers, "output", [1, 10]
 
-def train_lenet():
+def train_lenet_nobn():
     X, Y = load_mnist(limit_per_class=500)
     idx = np.arange(len(X)); np.random.shuffle(idx); X, Y = X[idx], Y[idx]
     split = int(0.9 * len(X))
@@ -62,7 +57,7 @@ def train_lenet():
     Y_train, Y_val = Y[:split], Y[split:]
     print(f"Dataset Split: Train={len(X_train)}, Val={len(X_val)}")
 
-    model = LeNet()
+    model = LeNetNoBN()
     params = model.parameters()
     optimizer = SGD(params, lr=0.01)
     metrics = Metrics()
@@ -73,7 +68,7 @@ def train_lenet():
     sizes = auto_warm(model.forward, params, X_train[:batch_size], Y_train[:batch_size], optimizer, copies=3)
     print(f"Pool warmed: {len(sizes)} buffer sizes pre-allocated")
 
-    print("\nStarting LeNet training on DirectCompute GPU...")
+    print("\nStarting LeNet (No BN) training on DirectCompute GPU...")
     start = time.time()
 
     for epoch in range(epochs):
@@ -118,7 +113,7 @@ def train_lenet():
     print(f"Pool stats: {hits} hits, {misses} misses ({hits/(hits+misses)*100:.1f}% hit rate)")
 
     # ONNX export
-    model.export("lenet.onnx", input_shape=[1, 1, 28, 28])
+    model.export("lenet_nobn.onnx", input_shape=[1, 1, 28, 28])
 
 if __name__ == "__main__":
-    train_lenet()
+    train_lenet_nobn()

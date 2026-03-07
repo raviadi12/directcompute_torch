@@ -3,10 +3,41 @@ import numpy as np
 import os
 import sys
 from PIL import Image
+import struct
 import time
 
+def float_to_uint(f):
+    return struct.unpack('I', struct.pack('f', f))[0]
+
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_dirs():
+    dirs = [
+        _MODULE_DIR,
+        os.path.join(_MODULE_DIR, "directcompute_nn"),
+        os.getcwd(),
+    ]
+    seen = set()
+    out = []
+    for path in dirs:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm not in seen and os.path.isdir(path):
+            seen.add(norm)
+            out.append(path)
+    return out
+
+
+def _find_resource(name):
+    for base in _resource_dirs():
+        candidate = os.path.join(base, name)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Could not find resource '{name}' in: {_resource_dirs()}")
+
+
 # Load the engine
-lib = ctypes.CDLL("./engine.dll")
+lib = ctypes.CDLL(_find_resource("engine.dll"))
 lib.InitEngine.restype = ctypes.c_bool
 lib.CompileShader.argtypes = [ctypes.c_char_p, ctypes.c_wchar_p]
 lib.CreateBuffer.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_uint]
@@ -111,13 +142,15 @@ shaders = ["matmul_universal", "matmul_coarsened", "add_bias", "relu", "relu_gra
            "conv_forward_tiled", "conv_backprop_filters_tiled", "conv_backprop_input_fused",
            "maxpool_forward", "maxpool_backward", "grad_accum", "im2col", "conv_reshape", "conv_grad_reshape", "col2im",
            "argmax_correct", "accumulate_scalar",
-           "bias_relu", "conv_grad_reshape_relu"]
+           "bias_relu", "conv_grad_reshape_relu",
+           "batchnorm_mean_var", "batchnorm_forward", "batchnorm_backward_reduce", "batchnorm_backward_dx",
+           "adam", "scale_add", "rms"]
 for s in shaders:
-    lib.CompileShader(s.encode(), f"nn_{s}.hlsl")
+    lib.CompileShader(s.encode(), _find_resource(f"nn_{s}.hlsl"))
 
 # Compile GPU-specific matmul variant
 if not _IS_IGPU:
-    lib.CompileShader(b"matmul_dgpu", "nn_matmul_dgpu.hlsl")
+    lib.CompileShader(b"matmul_dgpu", _find_resource("nn_matmul_dgpu.hlsl"))
     print("      Compiled dGPU matmul variant (TS=64, WPT=4, K_STEP=16)")
 else:
     print("      Using iGPU matmul variant (TS=64, WPT=4, K_STEP=32)")
@@ -304,60 +337,38 @@ cpu_profiler = CPUProfiler()
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Pre-allocated ctypes arrays for fast dispatch (avoid per-call allocation) ──
-_srv1 = (ctypes.c_void_p * 1)()
-_srv2 = (ctypes.c_void_p * 2)()
-_uav1 = (ctypes.c_void_p * 1)()
-_uav2 = (ctypes.c_void_p * 2)()
+_srv_arr = (ctypes.c_void_p * 8)()
+_uav_arr = (ctypes.c_void_p * 8)()
 _threads = (ctypes.c_uint * 3)()
 _cb = ParamsCB()
 
 def _dispatch(name, srvs, uavs, tx, ty, tz, u1=0, u2=0, u3=0, u4=0, u5=0, u6=0, u7=0, u8=0, u9=0, cbSize=16):
     """Fast shader dispatch with pre-allocated ctypes arrays (typed SRV/UAV)."""
     nS = len(srvs)
-    if nS == 1:
-        _srv1[0] = srvs[0]
-        srv_arr = _srv1
-    else:
-        _srv2[0] = srvs[0]; _srv2[1] = srvs[1]
-        srv_arr = _srv2
+    for i in range(nS): _srv_arr[i] = srvs[i]
     nU = len(uavs)
-    if nU == 1:
-        _uav1[0] = uavs[0]
-        uav_arr = _uav1
-    else:
-        _uav2[0] = uavs[0]; _uav2[1] = uavs[1]
-        uav_arr = _uav2
+    for i in range(nU): _uav_arr[i] = uavs[i]
     _threads[0] = tx; _threads[1] = ty; _threads[2] = tz
     if cbSize > 0:
         _cb.u1 = u1; _cb.u2 = u2; _cb.u3 = u3; _cb.u4 = u4
         _cb.u5 = u5; _cb.u6 = u6; _cb.u7 = u7; _cb.u8 = u8; _cb.u9 = u9
-        lib.RunShader(name, srv_arr, nS, uav_arr, nU, _threads, ctypes.byref(_cb), cbSize)
+        lib.RunShader(name, _srv_arr, nS, _uav_arr, nU, _threads, ctypes.byref(_cb), cbSize)
     else:
-        lib.RunShader(name, srv_arr, nS, uav_arr, nU, _threads, None, 0)
+        lib.RunShader(name, _srv_arr, nS, _uav_arr, nU, _threads, None, 0)
 
 def _dispatch_raw(name, srvs, uavs, tx, ty, tz, u1=0, u2=0, u3=0, u4=0, u5=0, u6=0, u7=0, u8=0, u9=0, cbSize=16):
     """Dispatch using raw SRV/UAV (ByteAddressBuffer/RWByteAddressBuffer)."""
     nS = len(srvs)
-    if nS == 1:
-        _srv1[0] = srvs[0]
-        srv_arr = _srv1
-    else:
-        _srv2[0] = srvs[0]; _srv2[1] = srvs[1]
-        srv_arr = _srv2
+    for i in range(nS): _srv_arr[i] = srvs[i]
     nU = len(uavs)
-    if nU == 1:
-        _uav1[0] = uavs[0]
-        uav_arr = _uav1
-    else:
-        _uav2[0] = uavs[0]; _uav2[1] = uavs[1]
-        uav_arr = _uav2
+    for i in range(nU): _uav_arr[i] = uavs[i]
     _threads[0] = tx; _threads[1] = ty; _threads[2] = tz
     if cbSize > 0:
         _cb.u1 = u1; _cb.u2 = u2; _cb.u3 = u3; _cb.u4 = u4
         _cb.u5 = u5; _cb.u6 = u6; _cb.u7 = u7; _cb.u8 = u8; _cb.u9 = u9
-        lib.RunShaderRaw(name, srv_arr, nS, uav_arr, nU, _threads, ctypes.byref(_cb), cbSize)
+        lib.RunShaderRaw(name, _srv_arr, nS, _uav_arr, nU, _threads, ctypes.byref(_cb), cbSize)
     else:
-        lib.RunShaderRaw(name, srv_arr, nS, uav_arr, nU, _threads, None, 0)
+        lib.RunShaderRaw(name, _srv_arr, nS, _uav_arr, nU, _threads, None, 0)
 
 _all_tensors = []
 
@@ -497,20 +508,36 @@ def _run_mm(a_buf, b_buf, out_buf, M, K, N, flags=0):
                   (N+_TILE_U-1)//_TILE_U, (M+_TILE_U-1)//_TILE_U, 1, u1=M, u2=K, u3=N, u4=flags)
 
 class MatMul(Function):
-    def forward(self, A, B):
+    def forward(self, A, B, transA=False, transB=False):
         self.inputs = (A, B)
-        M, K, N = A.shape[0], A.shape[1], B.shape[1]
-        out_handle = lib.MatMulAlloc(A.gpu_buf, B.gpu_buf, M, K, N, 0)
+        self.transA = transA
+        self.transB = transB
+        flags = (1 if transA else 0) | (2 if transB else 0)
+        
+        M = A.shape[1] if transA else A.shape[0]
+        K = A.shape[0] if transA else A.shape[1]
+        N = B.shape[0] if transB else B.shape[1]
+        
+        out_handle = lib.MatMulAlloc(A.gpu_buf, B.gpu_buf, M, K, N, flags)
         res = Tensor.from_gpu(out_handle, (M, N), requires_grad=A.requires_grad or B.requires_grad)
         res._ctx = self
         return res
+        
     def backward(self, grad_output):
         A, B = self.inputs
         if A.requires_grad:
-            out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, A.shape[0], B.shape[1], B.shape[0], 2)
+            # If C = A @ B, then dA = dC @ B^T
+            # If C = A^T @ B, then dA = B @ dC^T
+            flags_A = 2 if not self.transB else 0
+            M_A, K_A, N_A = grad_output.shape[0], B.shape[1], B.shape[0]
+            out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, M_A, K_A, N_A, flags_A)
             A._accumulate_grad(Tensor.from_gpu(out_handle, A.shape, track=True))
+            
         if B.requires_grad:
-            out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, A.shape[1], A.shape[0], grad_output.shape[1], 1)
+            # If C = A @ B, then dB = A^T @ dC
+            flags_B = 1 if not self.transA else 0
+            M_B, K_B, N_B = A.shape[1], A.shape[0], grad_output.shape[1]
+            out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, M_B, K_B, N_B, flags_B)
             B._accumulate_grad(Tensor.from_gpu(out_handle, B.shape, track=True))
 
 class Conv2D(Function):
@@ -699,7 +726,7 @@ class SoftmaxCEFunc(Function):
                   (num_classes+15)//16, (batch_size+15)//16, 1, u1=batch_size, u2=num_classes)
         x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
 
-def matmul(A, B): return MatMul().forward(A, B)
+def matmul(A, B, transA=False, transB=False): return MatMul().forward(A, B, transA, transB)
 def add_bias(A, B): return AddBias().forward(A, B)
 def bias_relu(A, B): return BiasReLUFunc().forward(A, B)
 def relu(x): return ReLUFunc().forward(x)
@@ -707,6 +734,102 @@ def softmax_ce(x, labels): return SoftmaxCEFunc().forward(x, labels)
 def conv2d(x, f, b, stride=1, padding=0, actType=0): return Conv2D().forward(x, f, b, stride, padding, actType)
 def maxpool2d(x, pool_size=2, stride=2): return MaxPool2D().forward(x, pool_size, stride)
 def flatten(x): return Flatten().forward(x)
+
+def scale_add(A, B, alpha=1.0, beta=1.0):
+    out_handle = lib.CreateBuffer(None, A.size)
+    _dispatch(b"scale_add", (A.gpu_buf, B.gpu_buf), (out_handle,),
+              (A.size + 255) // 256, 1, 1,
+              u1=A.size, u2=float_to_uint(alpha), u3=float_to_uint(beta), cbSize=16)
+    res = Tensor.from_gpu(out_handle, A.shape, track=True)
+    return res
+
+def rms(A):
+    out_handle = lib.CreateBuffer(None, 1)
+    _dispatch(b"rms", (A.gpu_buf,), (out_handle,),
+              1, 1, 1, u1=A.size, cbSize=16)
+    v = np.empty(1, dtype=np.float32)
+    lib.ReadBuffer(out_handle, v.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+    lib.ReleaseBuffer(out_handle)
+    return max(float(v[0]), 1e-8)
+
+class BatchNorm2dFunc(Function):
+    def forward(self, x, gamma, beta, running_mean, running_var, eps=1e-5, momentum=0.1, training=True):
+        self.inputs = (x, gamma, beta)
+        self.batch, self.channels, self.h, self.w = x.shape
+        self.S = self.h * self.w
+        self.eps = eps
+        
+        if training:
+            self.batch_mean_handle = lib.CreateBuffer(None, self.channels)
+            self.batch_var_handle = lib.CreateBuffer(None, self.channels)
+            
+            _dispatch(b"batchnorm_mean_var", 
+                      (x.gpu_buf,), 
+                      (self.batch_mean_handle, self.batch_var_handle, running_mean.gpu_buf, running_var.gpu_buf),
+                      self.channels, 1, 1, 
+                      u1=self.batch, u2=self.channels, u3=self.S, u4=int(training), u5=float_to_uint(momentum), cbSize=20)
+            
+            used_mean_buf = self.batch_mean_handle
+            used_var_buf = self.batch_var_handle
+        else:
+            used_mean_buf = running_mean.gpu_buf
+            used_var_buf = running_var.gpu_buf
+            self.batch_mean_handle = None
+            self.batch_var_handle = None
+
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"batchnorm_forward", 
+                  (x.gpu_buf, used_mean_buf, used_var_buf, gamma.gpu_buf, beta.gpu_buf), 
+                  (out_handle,),
+                  (x.size + 255) // 256, 1, 1,
+                  u1=self.batch, u2=self.channels, u3=self.S, u4=float_to_uint(eps), cbSize=16)
+
+        res = Tensor.from_gpu(out_handle, x.shape, requires_grad=x.requires_grad or gamma.requires_grad or beta.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        x, gamma, beta = self.inputs
+        
+        if self.batch_mean_handle is None:
+            raise RuntimeError("BatchNorm backward requires training=True during forward")
+        
+        dgamma_handle = lib.CreateBuffer(None, self.channels)
+        dbeta_handle = lib.CreateBuffer(None, self.channels)
+        
+        _dispatch(b"batchnorm_backward_reduce",
+                  (x.gpu_buf, grad_output.gpu_buf, self.batch_mean_handle, self.batch_var_handle),
+                  (dgamma_handle, dbeta_handle),
+                  self.channels, 1, 1,
+                  u1=self.batch, u2=self.channels, u3=self.S, u4=float_to_uint(self.eps))
+
+        dx_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"batchnorm_backward_dx",
+                  (x.gpu_buf, grad_output.gpu_buf, self.batch_mean_handle, self.batch_var_handle, gamma.gpu_buf, dgamma_handle, dbeta_handle),
+                  (dx_handle,),
+                  (x.size + 255) // 256, 1, 1,
+                  u1=self.batch, u2=self.channels, u3=self.S, u4=float_to_uint(self.eps))
+
+        if gamma.requires_grad:
+            gamma._accumulate_grad(Tensor.from_gpu(dgamma_handle, gamma.shape, track=True))
+        else:
+            lib.ReleaseBuffer(dgamma_handle)
+            
+        if beta.requires_grad:
+            beta._accumulate_grad(Tensor.from_gpu(dbeta_handle, beta.shape, track=True))
+        else:
+            lib.ReleaseBuffer(dbeta_handle)
+            
+        if x.requires_grad:
+            x._accumulate_grad(Tensor.from_gpu(dx_handle, x.shape, track=True))
+        else:
+            lib.ReleaseBuffer(dx_handle)
+            
+        lib.ReleaseBuffer(self.batch_mean_handle)
+        lib.ReleaseBuffer(self.batch_var_handle)
+
+def batchnorm2d(x, gamma, beta, rm, rv, eps=1e-5, momentum=0.1, training=True):
+    return BatchNorm2dFunc().forward(x, gamma, beta, rm, rv, eps, momentum, training)
 
 class Linear:
     def __init__(self, in_features, out_features):
@@ -727,6 +850,261 @@ class ConvLayer:
     def __call__(self, x, actType=0, relu=False):
         act = 1 if relu else actType
         return conv2d(x, self.filters, self.bias, self.stride, self.padding, act)
+
+class BatchNorm2d:
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.gamma = Tensor(np.ones(num_features, dtype=np.float32), requires_grad=True, track=False)
+        self.beta = Tensor(np.zeros(num_features, dtype=np.float32), requires_grad=True, track=False)
+        self.running_mean = Tensor(np.zeros(num_features, dtype=np.float32), requires_grad=False, track=False)
+        self.running_var = Tensor(np.ones(num_features, dtype=np.float32), requires_grad=False, track=False)
+        self.training = True
+        
+    def __call__(self, x):
+        return batchnorm2d(x, self.gamma, self.beta, self.running_mean, self.running_var, self.eps, self.momentum, self.training)
+
+
+class Model:
+    """Base class for models. Provides parameter discovery, export, and save/load.
+
+    Usage:
+        class LeNet(Model):
+            def __init__(self):
+                super().__init__()
+                self.c1 = ConvLayer(1, 6, 5)
+                self.l1 = Linear(256, 120)
+            def forward(self, x):
+                ...
+
+        model = LeNet()
+        model.parameters()          # auto-discovers all layer params
+        model.export("lenet.onnx")  # exports to ONNX after training
+    """
+
+    def __init__(self):
+        self._forward_trace = []   # populated by export()
+
+    def __call__(self, x):
+        return self.forward(x)
+
+    def forward(self, x):
+        raise NotImplementedError
+
+    def parameters(self):
+        """Auto-discover all trainable parameters from ConvLayer and Linear attributes."""
+        params = []
+        for name in dir(self):
+            attr = getattr(self, name)
+            if isinstance(attr, ConvLayer):
+                params.extend([attr.filters, attr.bias])
+            elif isinstance(attr, Linear):
+                params.extend([attr.w, attr.b])
+            elif hasattr(attr, '__class__') and attr.__class__.__name__ == 'BatchNorm2d':
+                params.extend([attr.gamma, attr.beta])
+        return params
+
+    def train(self, mode=True):
+        for name in dir(self):
+            attr = getattr(self, name)
+            if hasattr(attr, 'training'):
+                attr.training = mode
+
+    def eval(self):
+        self.train(False)
+
+    def _get_layers(self):
+        """Return ordered list of (name, layer) tuples."""
+        layers = []
+        for name in sorted(dir(self)):
+            attr = getattr(self, name)
+            if isinstance(attr, (ConvLayer, Linear)):
+                layers.append((name, attr))
+        return layers
+
+    def export(self, path, input_shape=None, model_name=None):
+        """Export trained model to ONNX format.
+
+        Args:
+            path: output .onnx file path
+            input_shape: e.g. [1, 1, 28, 28] — required for graph construction.
+                         Batch dim is made dynamic automatically.
+            model_name: name embedded in the ONNX model (defaults to class name)
+        """
+        try:
+            import onnx
+            from onnx import helper, TensorProto, numpy_helper
+        except ImportError:
+            print("Install 'onnx' package to export: pip install onnx")
+            return
+
+        if input_shape is None:
+            raise ValueError("input_shape required, e.g. [1, 1, 28, 28]")
+        if model_name is None:
+            model_name = self.__class__.__name__
+
+        # Trace the forward pass to discover the ONNX graph structure
+        nodes, initializers = [], []
+        tensor_id = [0]
+        def _next_name(prefix="t"):
+            tensor_id[0] += 1
+            return f"{prefix}_{tensor_id[0]}"
+
+        # Walk through the forward pass by running a dummy trace
+        # We inspect the model structure from layer attributes + forward() definition
+        # This uses the _onnx_graph() hook if defined, otherwise auto-traces from layers
+        if hasattr(self, '_onnx_graph'):
+            nodes, initializers, output_name, output_shape = self._onnx_graph(
+                input_shape, helper, TensorProto, numpy_helper)
+        else:
+            raise NotImplementedError(
+                "Define _onnx_graph(self, input_shape, helper, TensorProto, numpy_helper) "
+                "or use the pre-built LeNet/AlexNet models")
+
+        # Build ONNX model
+        input_shape_dynamic = [None] + list(input_shape[1:])
+        output_shape_dynamic = [None] + list(output_shape[1:])
+
+        graph = helper.make_graph(
+            nodes,
+            model_name,
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, input_shape_dynamic)],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape_dynamic)],
+            initializer=initializers,
+        )
+
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.save(model, path)
+
+        size = os.path.getsize(path)
+        if size < 1024:
+            sz = f"{size} B"
+        elif size < 1024 * 1024:
+            sz = f"{size / 1024:.1f} KB"
+        else:
+            sz = f"{size / (1024 * 1024):.1f} MB"
+        print(f"Model exported to {path} ({sz})")
+
+    @staticmethod
+    def _conv_onnx(layer, name, input_name, output_name, helper, numpy_helper, initializers, nodes, with_relu=False, pool=None):
+        """Helper: add Conv (+ optional Relu + MaxPool) ONNX nodes."""
+        w = layer.filters.sync()  # (outC, inC, kH, kW) — matches ONNX
+        b = layer.bias.sync()
+        initializers.append(numpy_helper.from_array(w, f"{name}_w"))
+        initializers.append(numpy_helper.from_array(b, f"{name}_b"))
+
+        conv_out = f"{name}_conv"
+        ks = [w.shape[2], w.shape[3]]
+        nodes.append(helper.make_node("Conv", [input_name, f"{name}_w", f"{name}_b"], [conv_out],
+                                      kernel_shape=ks,
+                                      strides=[layer.stride, layer.stride],
+                                      pads=[layer.padding, layer.padding, layer.padding, layer.padding]))
+        current = conv_out
+        if with_relu:
+            relu_out = f"{name}_relu"
+            nodes.append(helper.make_node("Relu", [current], [relu_out]))
+            current = relu_out
+        if pool:
+            pool_out = output_name
+            nodes.append(helper.make_node("MaxPool", [current], [pool_out],
+                                          kernel_shape=[pool[0], pool[0]],
+                                          strides=[pool[1], pool[1]]))
+            current = pool_out
+        else:
+            # rename last output
+            if current != output_name:
+                nodes[-1].output[0] = output_name
+        return output_name
+
+    @staticmethod
+    def _linear_onnx(layer, name, input_name, output_name, helper, numpy_helper, initializers, nodes, with_relu=False):
+        """Helper: add Gemm (+ optional Relu) ONNX nodes."""
+        w = layer.w.sync().T  # (in, out) → (out, in) for ONNX Gemm transB=1
+        b = layer.b.sync()
+        initializers.append(numpy_helper.from_array(w, f"{name}_w"))
+        initializers.append(numpy_helper.from_array(b, f"{name}_b"))
+
+        gemm_out = f"{name}_gemm" if with_relu else output_name
+        nodes.append(helper.make_node("Gemm", [input_name, f"{name}_w", f"{name}_b"], [gemm_out], transB=1))
+        if with_relu:
+            nodes.append(helper.make_node("Relu", [gemm_out], [output_name]))
+        return output_name
+
+class ONNXModel(Model):
+    """Dynamically parses and executes an ONNX model.
+    Usage:
+        model = ONNXModel("lenet.onnx")
+        logits = model(xb)
+    """
+    def __init__(self, path):
+        super().__init__()
+        try:
+            import onnx
+            from onnx import numpy_helper
+        except ImportError:
+            raise ImportError("Install 'onnx' package to load models: pip install onnx")
+        
+        self.onnx_model = onnx.load(path)
+        self.graph = self.onnx_model.graph
+        
+        self.initializers = {}
+        for init in self.graph.initializer:
+            data = numpy_helper.to_array(init)
+            self.initializers[init.name] = Tensor(data, track=False, requires_grad=False)
+            
+    def parameters(self):
+        # By default, ONNX models are loaded for inference
+        return []
+
+    def forward(self, x):
+        tensors = {self.graph.input[0].name: x}
+        tensors.update(self.initializers)
+        
+        for node in self.graph.node:
+            inputs = [tensors[name] for name in node.input]
+            op = node.op_type
+            
+            if op == "Conv":
+                w, b = inputs[1], inputs[2] if len(inputs) > 2 else Tensor(np.zeros(w.shape[0]))
+                attrs = {a.name: a for a in node.attribute}
+                stride = attrs['strides'].ints[0] if 'strides' in attrs else 1
+                padding = attrs['pads'].ints[0] if 'pads' in attrs else 0
+                out = conv2d(inputs[0], w, b, stride=stride, padding=padding)
+            elif op == "Relu":
+                out = relu(inputs[0])
+            elif op == "MaxPool":
+                attrs = {a.name: a for a in node.attribute}
+                pool_size = attrs['kernel_shape'].ints[0] if 'kernel_shape' in attrs else 2
+                stride = attrs['strides'].ints[0] if 'strides' in attrs else 2
+                out = maxpool2d(inputs[0], pool_size=pool_size, stride=stride)
+            elif op == "Flatten":
+                out = flatten(inputs[0])
+            elif op == "Gemm":
+                attrs = {a.name: a for a in node.attribute}
+                w, b = inputs[1], inputs[2]
+                # Gemm in ONNX usually has transB=1
+                # Our matmul assumes (N, K) @ (K, M).
+                # If ONNX w is (M, K) and transB=1, we need to transpose w.
+                # However, ONNX initializers are loaded as Tensors. We don't have transpose yet,
+                # but we can reuse the linear logic.
+                # Since we don't have dynamic transpose, we do it in numpy and upload? No, w is static!
+                # Wait, Gemm weight is static.
+                if attrs.get('transB', None) and attrs['transB'].i == 1:
+                    w_data = w.sync()
+                    w = Tensor(w_data.T, track=False)
+                out = add_bias(matmul(inputs[0], w), b)
+            else:
+                raise NotImplementedError(f"ONNX operator '{op}' not supported yet.")
+                
+            for out_name in node.output:
+                tensors[out_name] = out
+                
+        return tensors[self.graph.output[0].name]
+
+
 
 class SGD:
     def __init__(self, params, lr):
@@ -753,6 +1131,129 @@ class SGD:
         if n > 0:
             lib.SGDBatch(self._param_arr, self._grad_arr, self._size_arr,
                          n, self.lr, clip)
+
+
+class AdamW:
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        self.params = params
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.t = 0
+        self.m = [Tensor(np.zeros(p.shape), track=False) for p in params]
+        self.v = [Tensor(np.zeros(p.shape), track=False) for p in params]
+        # Keep references alive
+        self._m_bufs = [x.gpu_buf for x in self.m]
+        self._v_bufs = [x.gpu_buf for x in self.v]
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad: p.grad = None
+
+    def step(self, clip=1.0):
+        self.t += 1
+        # bias correction
+        step_size = self.lr * (1 - self.beta2**self.t)**0.5 / (1 - self.beta1**self.t)
+        
+        # We process in python loop, each dispatch takes ~0.005ms
+        for i, p in enumerate(self.params):
+            if not p.grad: continue
+            _dispatch_raw(
+                b"adam", 
+                (p.grad.gpu_buf,), 
+                (p.gpu_buf, self._m_bufs[i], self._v_bufs[i]),
+                (p.size + 255) // 256, 1, 1,
+                u1=p.size, 
+                u2=float_to_uint(step_size), 
+                u3=float_to_uint(self.beta1), 
+                u4=float_to_uint(self.beta2),
+                u5=float_to_uint(self.eps),
+                u6=float_to_uint(self.lr * self.weight_decay),
+                u7=float_to_uint(clip),
+                cbSize=32
+            )
+
+class Adam(AdamW):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+        super().__init__(params, lr, betas, eps, weight_decay=0.0)
+
+class Muon:
+    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.01, ns_steps=5):
+        self.params = params
+        self.lr = lr
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.ns_steps = ns_steps
+        self.m = [Tensor(np.zeros(p.shape, dtype=np.float32), track=False) for p in params]
+        # AdamW objects internally for 1D variables
+        self.adam_fallback = AdamW(params, lr=lr*0.1, weight_decay=weight_decay)
+        
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad: p.grad = None
+
+    def step(self, clip=1.0):
+        # 1D params use AdamW
+        self.adam_fallback.t += 1
+        step_size_adam = self.adam_fallback.lr * (1 - self.adam_fallback.beta2**self.adam_fallback.t)**0.5 / (1 - self.adam_fallback.beta1**self.adam_fallback.t)
+
+        for i, p in enumerate(self.params):
+            if not p.grad: continue
+            
+            if len(p.shape) < 2:
+                # SGD / AdamW fallback for 1D
+                _dispatch_raw(
+                    b"adam", 
+                    (p.grad.gpu_buf,), 
+                    (p.gpu_buf, self.adam_fallback._m_bufs[i], self.adam_fallback._v_bufs[i]),
+                    (p.size + 255) // 256, 1, 1,
+                    u1=p.size, u2=float_to_uint(step_size_adam), u3=float_to_uint(self.adam_fallback.beta1), 
+                    u4=float_to_uint(self.adam_fallback.beta2), u5=float_to_uint(self.adam_fallback.eps),
+                    u6=float_to_uint(self.adam_fallback.lr * self.adam_fallback.weight_decay),
+                    u7=float_to_uint(clip), cbSize=32
+                )
+                continue
+                
+            # 2D variables (or flattened ND) use Muon
+            # 1. Update momentum: m = momentum * m + grad
+            _dispatch_raw(
+                b"scale_add",
+                (self.m[i].gpu_buf, p.grad.gpu_buf),
+                (self.m[i].gpu_buf,),
+                (p.size + 255) // 256, 1, 1,
+                u1=p.size, u2=float_to_uint(self.momentum), u3=float_to_uint(1.0), cbSize=16
+            )
+            
+            # 2. View as 2D for Newton-Schulz
+            M = p.shape[0]
+            K = p.size // M
+            m_2d = Tensor.from_gpu(self.m[i].gpu_buf, (M, K), track=False)
+            
+            # 3. RMS Norm
+            g_rms = rms(m_2d)
+            X = scale_add(m_2d, m_2d, 1.0 / g_rms, 0.0)
+            
+            # 4. Newton Schulz iteration
+            for _ in range(self.ns_steps):
+                if M >= K:
+                    A = matmul(X, X, transA=True)  # X^T @ X
+                    B = matmul(X, A)               # X @ (X^T X)
+                else:
+                    A = matmul(X, X, transB=True)  # X @ X^T
+                    B = matmul(A, X)               # (X X^T) @ X
+                
+                # X = 1.5 * X - 0.5 * B
+                X = scale_add(X, B, 1.5, -0.5)
+
+            # 5. Apply weight decay & update: w = w * (1 - lr*wd) - lr * X
+            _dispatch_raw(
+                b"scale_add",
+                (p.gpu_buf, X.gpu_buf),
+                (p.gpu_buf,),
+                (p.size + 255) // 256, 1, 1,
+                u1=p.size, u2=float_to_uint(1.0 - self.lr * self.weight_decay), u3=float_to_uint(-self.lr), cbSize=16
+            )
 
 # ── Internal GPU helpers (used by Metrics class) ─────────────────────────────
 def gpu_argmax_correct(logits, labels, correct_buf):
@@ -1201,60 +1702,6 @@ class ComputeGraph:
                     lib.ReleaseBuffer(self._grad_bufs[i])
             self._grad_bufs = None
         self._compiled = False
-    
-    def __del__(self):
-        self.release()
-
-
-# ── Reusable Input Tensor ────────────────────────────────────────────────────
-
-class ReusableTensor:
-    """A GPU tensor that reuses its buffer across batches via UpdateBuffer.
-    Avoids CreateBuffer overhead on every batch.
-    
-    Usage:
-        rb = ReusableTensor(shape=(32, 1, 28, 28))
-        for batch_data in batches:
-            xb = rb.update(batch_data)  # fast UpdateBuffer, no alloc
-    """
-    def __init__(self, shape, track=True):
-        self._max_size = _shape_size(shape)
-        self._shape = shape
-        self._handle = lib.CreateBuffer(None, self._max_size)
-        self._track = track
-    
-    def update(self, data):
-        """Upload new data and return a Tensor wrapping the same GPU buffer.
-        Data size must match the allocated size."""
-        if isinstance(data, np.ndarray):
-            if data.dtype != np.float32:
-                data = data.astype(np.float32)
-        else:
-            data = np.array(data, dtype=np.float32)
-        
-        size = data.size
-        if size != self._max_size:
-            # Size changed — reallocate (happens on last batch with fewer samples)
-            lib.ReleaseBuffer(self._handle)
-            self._handle = lib.CreateBuffer(
-                data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), size)
-            self._max_size = size
-            self._shape = data.shape
-        else:
-            lib.UpdateBuffer(self._handle, 
-                           data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
-            self._shape = data.shape
-        
-        # Create a lightweight Tensor wrapping this handle (AddRef to prevent double-free)
-        lib.AddRefBuffer(self._handle)
-        t = Tensor.from_gpu(self._handle, data.shape, requires_grad=False, track=self._track)
-        t.data = data
-        return t
-    
-    def release(self):
-        if self._handle:
-            lib.ReleaseBuffer(self._handle)
-            self._handle = None
     
     def __del__(self):
         self.release()

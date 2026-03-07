@@ -1,0 +1,17 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+include nn_engine.py
+include export_onnx.py
+include engine.cpp
+include engine.dll
+include compile_engine.bat
+graft directcompute_nn
+prune backup_old_version
+prune __pycache__
+global-exclude *.py[cod]
+global-exclude *.obj
+global-exclude *.lib
+global-exclude *.exp
+global-exclude *.exe

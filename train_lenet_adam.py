@@ -2,7 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 import time
-from nn_engine import (Tensor, Linear, ConvLayer, Model, SGD, Metrics,
+from nn_engine import (Tensor, Linear, ConvLayer, Model, Adam, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
                        bias_relu, auto_warm, get_pool_stats,
                        BatchNorm2d)
@@ -54,7 +54,7 @@ class LeNet(Model):
         g(self.l3, "l3", "fc2", "output", helper, numpy_helper, initializers, nodes)
         return nodes, initializers, "output", [1, 10]
 
-def train_lenet():
+def train_lenet_adam():
     X, Y = load_mnist(limit_per_class=500)
     idx = np.arange(len(X)); np.random.shuffle(idx); X, Y = X[idx], Y[idx]
     split = int(0.9 * len(X))
@@ -64,7 +64,8 @@ def train_lenet():
 
     model = LeNet()
     params = model.parameters()
-    optimizer = SGD(params, lr=0.01)
+    # Using Adam instead of SGD
+    optimizer = Adam(params, lr=0.001)
     metrics = Metrics()
     batch_size = 32
     epochs = 25
@@ -73,7 +74,7 @@ def train_lenet():
     sizes = auto_warm(model.forward, params, X_train[:batch_size], Y_train[:batch_size], optimizer, copies=3)
     print(f"Pool warmed: {len(sizes)} buffer sizes pre-allocated")
 
-    print("\nStarting LeNet training on DirectCompute GPU...")
+    print("\nStarting LeNet training on DirectCompute GPU with Adam...")
     start = time.time()
 
     for epoch in range(epochs):
@@ -118,7 +119,7 @@ def train_lenet():
     print(f"Pool stats: {hits} hits, {misses} misses ({hits/(hits+misses)*100:.1f}% hit rate)")
 
     # ONNX export
-    model.export("lenet.onnx", input_shape=[1, 1, 28, 28])
+    model.export("lenet_adam.onnx", input_shape=[1, 1, 28, 28])
 
 if __name__ == "__main__":
-    train_lenet()
+    train_lenet_adam()

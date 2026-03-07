@@ -1,3 +1,30 @@
+Metadata-Version: 2.4
+Name: directcompute-nn
+Version: 0.1.4
+Summary: Windows-only GPU neural network training via DirectCompute (D3D11 Compute Shaders)
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/raviadi12/directcompute_torch
+Project-URL: Repository, https://github.com/raviadi12/directcompute_torch
+Keywords: directcompute,d3d11,gpu,neural-network,windows,onnx
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Requires-Dist: Pillow>=9.0
+Provides-Extra: onnx
+Requires-Dist: onnx>=1.14; extra == "onnx"
+Dynamic: license-file
+
 # DirectCompute Neural Network Engine
 
 A from-scratch neural network training framework that runs entirely on the GPU using **DirectCompute (D3D11 Compute Shaders)**. No CUDA, no cuDNN — just raw HLSL shaders dispatched through a thin C++ runtime, driven from Python via ctypes.
