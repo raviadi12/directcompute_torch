@@ -34,6 +34,11 @@ directcompute_nn/nn_conv_grad_reshape.hlsl
 directcompute_nn/nn_conv_grad_reshape_relu.hlsl
 directcompute_nn/nn_conv_reduce_filters.hlsl
 directcompute_nn/nn_conv_reshape.hlsl
+directcompute_nn/nn_depthwise_conv_backward_filter.hlsl
+directcompute_nn/nn_depthwise_conv_backward_input.hlsl
+directcompute_nn/nn_depthwise_conv_forward.hlsl
+directcompute_nn/nn_global_avg_pool.hlsl
+directcompute_nn/nn_global_avg_pool_backward.hlsl
 directcompute_nn/nn_grad_accum.hlsl
 directcompute_nn/nn_im2col.hlsl
 directcompute_nn/nn_loss.hlsl
@@ -47,6 +52,8 @@ directcompute_nn/nn_matmul_universal.hlsl
 directcompute_nn/nn_maxpool_backward.hlsl
 directcompute_nn/nn_maxpool_forward.hlsl
 directcompute_nn/nn_relu.hlsl
+directcompute_nn/nn_relu6.hlsl
+directcompute_nn/nn_relu6_grad.hlsl
 directcompute_nn/nn_relu_grad.hlsl
 directcompute_nn/nn_rms.hlsl
 directcompute_nn/nn_scale_add.hlsl

@@ -466,6 +466,135 @@ extern "C" __declspec(dllexport) void SGDBatch(void** params, void** grads, uint
     g_prevUavCount = 1;
 }
 
+// ── Batched SGD with GPU-side gradient clipping ──
+// Computes global grad norm entirely on GPU, clips, then does SGD.
+// Returns the total grad norm (1 float readback instead of N full-param readbacks).
+struct GradReduceParams { uint32_t count; uint32_t globalOffset; };
+struct NormFinalParams { uint32_t totalPartials; uint32_t maxNormBits; };
+struct SGDClipParams { uint32_t count; uint32_t lrBits; };
+
+extern "C" __declspec(dllexport) float SGDBatchClipped(void** params, void** grads, uint32_t* sizes,
+    uint32_t numParams, float lr, float maxNorm) {
+    if (!g_context || numParams == 0) return 0.0f;
+
+    auto itReduce = g_shaders.find("grad_sq_reduce");
+    auto itFinal  = g_shaders.find("grad_norm_final");
+    auto itSGD    = g_shaders.find("sgd_clipped");
+    if (itReduce == g_shaders.end() || itFinal == g_shaders.end() || itSGD == g_shaders.end())
+        return 0.0f;
+
+    // Calculate total partial groups needed
+    uint32_t totalPartials = 0;
+    for (uint32_t i = 0; i < numParams; i++)
+        totalPartials += (sizes[i] + 255) / 256;
+
+    // Allocate temp buffers
+    void* partials  = CreateBuffer(nullptr, totalPartials);
+    void* normScale = CreateBuffer(nullptr, 2);  // [norm, scale]
+    if (!partials || !normScale) return 0.0f;
+
+    // ── Phase 1: Compute per-group grad² partial sums ──
+    ID3D11ComputeShader* reduceShader = itReduce->second;
+    g_context->CSSetShader(reduceShader, nullptr, 0);
+
+    uint32_t alignedCB = 16;
+    if (!g_cbCache || g_cbCacheSize < alignedCB) {
+        if (g_cbCache) g_cbCache->Release();
+        D3D11_BUFFER_DESC cbd = { alignedCB, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+        g_device->CreateBuffer(&cbd, nullptr, &g_cbCache);
+        g_cbCacheSize = alignedCB;
+    }
+
+    ID3D11UnorderedAccessView* partialUAV[1] = { ((GPUBuffer*)partials)->uav };
+    g_context->CSSetUnorderedAccessViews(0, 1, partialUAV, nullptr);
+
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < numParams; i++) {
+        if (!grads[i]) continue;
+        GPUBuffer* grad = (GPUBuffer*)grads[i];
+        ID3D11ShaderResourceView* srvPtrs[1] = { grad->srv };
+        g_context->CSSetShaderResources(0, 1, srvPtrs);
+
+        GradReduceParams rp = { sizes[i], offset };
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_context->Map(g_cbCache, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &rp, sizeof(rp));
+            g_context->Unmap(g_cbCache, 0);
+            g_context->CSSetConstantBuffers(0, 1, &g_cbCache);
+        }
+        uint32_t groups = (sizes[i] + 255) / 256;
+        g_context->Dispatch(groups, 1, 1);
+        offset += groups;
+    }
+
+    // Unbind phase 1
+    g_context->CSSetShaderResources(0, 1, g_nullSRVs);
+    g_context->CSSetUnorderedAccessViews(0, 1, g_nullUAVs, nullptr);
+
+    // ── Phase 2: Reduce all partials → total norm + clip scale ──
+    g_context->CSSetShader(itFinal->second, nullptr, 0);
+    {
+        ID3D11ShaderResourceView* srvPtrs[1] = { ((GPUBuffer*)partials)->srv };
+        g_context->CSSetShaderResources(0, 1, srvPtrs);
+        ID3D11UnorderedAccessView* uavPtrs[1] = { ((GPUBuffer*)normScale)->uav };
+        g_context->CSSetUnorderedAccessViews(0, 1, uavPtrs, nullptr);
+
+        uint32_t maxNormBits;
+        memcpy(&maxNormBits, &maxNorm, 4);
+        NormFinalParams fp = { totalPartials, maxNormBits };
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_context->Map(g_cbCache, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &fp, sizeof(fp));
+            g_context->Unmap(g_cbCache, 0);
+            g_context->CSSetConstantBuffers(0, 1, &g_cbCache);
+        }
+        g_context->Dispatch(1, 1, 1);
+    }
+    g_context->CSSetShaderResources(0, 1, g_nullSRVs);
+    g_context->CSSetUnorderedAccessViews(0, 1, g_nullUAVs, nullptr);
+
+    // ── Phase 3: SGD with clip scale from GPU buffer ──
+    g_context->CSSetShader(itSGD->second, nullptr, 0);
+
+    uint32_t lrBits;
+    memcpy(&lrBits, &lr, 4);
+
+    for (uint32_t i = 0; i < numParams; i++) {
+        if (!params[i] || !grads[i]) continue;
+        GPUBuffer* grad = (GPUBuffer*)grads[i];
+        GPUBuffer* param = (GPUBuffer*)params[i];
+
+        ID3D11ShaderResourceView* srvPtrs[2] = { grad->srv, ((GPUBuffer*)normScale)->srv };
+        g_context->CSSetShaderResources(0, 2, srvPtrs);
+        ID3D11UnorderedAccessView* uavPtrs[1] = { param->uav };
+        g_context->CSSetUnorderedAccessViews(0, 1, uavPtrs, nullptr);
+
+        SGDClipParams sp = { sizes[i], lrBits };
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_context->Map(g_cbCache, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, &sp, sizeof(sp));
+            g_context->Unmap(g_cbCache, 0);
+            g_context->CSSetConstantBuffers(0, 1, &g_cbCache);
+        }
+        g_context->Dispatch((sizes[i] + 255) / 256, 1, 1);
+    }
+
+    // Final unbind
+    g_context->CSSetShaderResources(0, 2, g_nullSRVs);
+    g_context->CSSetUnorderedAccessViews(0, 1, g_nullUAVs, nullptr);
+    g_prevSrvCount = 2;
+    g_prevUavCount = 1;
+
+    // Read back just the norm (1 tiny GPU→CPU read instead of 30 full params)
+    float normData[2] = {0.0f, 0.0f};
+    ReadBuffer(normScale, normData);
+    float totalNorm = normData[0];
+
+    ReleaseBuffer(partials);
+    ReleaseBuffer(normScale);
+    return totalNorm;
+}
+
 // ── Pool Warm-up: pre-create buffers and return them to pool ──
 extern "C" __declspec(dllexport) void WarmPool(uint32_t* sizes, uint32_t numSizes, uint32_t copies) {
     if (!g_device) return;
@@ -548,6 +677,24 @@ static void MatMulDispatch(void* a_buf, void* b_buf, void* out_buf,
     uint32_t cbData[4] = {M, K, N, flags};
     void* srvs[2] = {a_buf, b_buf};
     void* uavs[1] = {out_buf};
+
+    // Use parallel-reduction kernel ONLY when output is extremely small.
+    // matmul_reduce dispatches (N, M, 1) = M*N groups, each with 256 threads.
+    // This is ONLY beneficial when M*N is tiny (e.g. Conv1 dFilter: 6*25=150 groups).
+    // For larger M*N (e.g. UNet up1: 16*432=6912 groups), the overhead of
+    // 6912 groups × 256 threads × 1KB shared mem + 8 barriers = catastrophic!
+    // Threshold: output_groups < 8 catches M*N < ~1024 (safe), K > 512 ensures benefit.
+    uint32_t output_groups = ((N + 15) / 16) * ((M + 15) / 16);
+    if (output_groups < 8 && K > 512) {
+        // Use matmul_reduce: one group per output element, 256 threads reduce K
+        // Best for conv backward dFilter where M×N is tiny but K is huge
+        uint32_t threads[3] = {N, M, 1};
+        auto it = g_shaders.find("matmul_reduce");
+        if (it != g_shaders.end()) {
+            DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cbData, 16);
+            return;
+        }
+    }
 
     if (M >= 64 && N >= 64) {
         uint32_t threads[3] = {(N + tileC - 1) / tileC, (M + tileC - 1) / tileC, 1};

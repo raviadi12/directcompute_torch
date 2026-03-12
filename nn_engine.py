@@ -56,6 +56,8 @@ lib.RunShaderAlloc.restype = ctypes.c_void_p
 lib.RunShaderAlloc2.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p, ctypes.c_uint]
 lib.RunShaderAlloc2.restype = ctypes.c_void_p
 lib.SGDBatch.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_float, ctypes.c_float]
+lib.SGDBatchClipped.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_float, ctypes.c_float]
+lib.SGDBatchClipped.restype = ctypes.c_float
 lib.ReleaseBufferBatch.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
 lib.FlushGPU.argtypes = []
 lib.FlushGPU.restype = None
@@ -147,7 +149,11 @@ shaders = ["matmul_universal", "matmul_coarsened", "add_bias", "relu", "relu_gra
            "adam", "scale_add", "rms",
            "depthwise_conv_forward", "depthwise_conv_backward_input", "depthwise_conv_backward_filter",
            "global_avg_pool", "global_avg_pool_backward", "add",
-           "relu6", "relu6_grad"]
+           "relu6", "relu6_grad", "leaky_relu", "leaky_relu_grad",
+           "upsample", "upsample_backward", "concat_insert", "slice",
+           "dice_loss", "dice_loss_grad", "sigmoid", "sigmoid_grad",
+           "matmul_reduce",
+           "dice_loss_sums", "grad_sq_reduce", "grad_norm_final", "sgd_clipped"]
 for s in shaders:
     lib.CompileShader(s.encode(), _find_resource(f"nn_{s}.hlsl"))
 
@@ -731,6 +737,114 @@ class ReLU6Func(Function):
                       (x.size+255)//256, 1, 1, u1=x.size)
             x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
 
+class SigmoidFunc(Function):
+    def forward(self, x):
+        self.inputs = (x,)
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"sigmoid", (x.gpu_buf,), (out_handle,),
+                  (x.size+255)//256, 1, 1, u1=x.size)
+        res = Tensor.from_gpu(out_handle, x.shape, requires_grad=x.requires_grad)
+        res._ctx = self
+        self.out_tensor = res
+        return res
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            out_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"sigmoid_grad", (grad_output.gpu_buf, self.out_tensor.gpu_buf), (out_handle,),
+                      (x.size+255)//256, 1, 1, u1=x.size)
+            x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
+
+class LeakyReLUFunc(Function):
+    def forward(self, x, alpha=0.1):
+        self.inputs = (x,)
+        self.alpha = alpha
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"leaky_relu", (x.gpu_buf,), (out_handle,),
+                  (x.size+255)//256, 1, 1, u1=x.size, u2=float_to_uint(alpha))
+        res = Tensor.from_gpu(out_handle, x.shape, requires_grad=x.requires_grad)
+        res._ctx = self
+        return res
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            out_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"leaky_relu_grad", (grad_output.gpu_buf, x.gpu_buf), (out_handle,),
+                      (x.size+255)//256, 1, 1, u1=x.size, u2=float_to_uint(self.alpha))
+            x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
+
+class UpSample2D(Function):
+    def forward(self, x, scaleH=2, scaleW=2):
+        self.inputs = (x,)
+        self.scaleH = scaleH
+        self.scaleW = scaleW
+        batch, C, inH, inW = x.shape
+        outH, outW = inH * scaleH, inW * scaleW
+        out_size = batch * C * outH * outW
+        out_handle = lib.CreateBuffer(None, out_size)
+        
+        _dispatch(b"upsample", (x.gpu_buf,), (out_handle,),
+                  (out_size+255)//256, 1, 1, 
+                  u1=batch, u2=C, u3=inH, u4=inW, u5=outH, u6=outW, u7=scaleH, u8=scaleW, cbSize=32)
+        
+        res = Tensor.from_gpu(out_handle, (batch, C, outH, outW), requires_grad=x.requires_grad)
+        res._ctx = self
+        return res
+    
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            batch, C, inH, inW = x.shape
+            outH, outW = inH * self.scaleH, inW * self.scaleW
+            out_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"upsample_backward", (grad_output.gpu_buf,), (out_handle,),
+                      (x.size+255)//256, 1, 1,
+                      u1=batch, u2=C, u3=inH, u4=inW, u5=outH, u6=outW, u7=self.scaleH, u8=self.scaleW, cbSize=32)
+            x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
+
+class Concat(Function):
+    def forward(self, tensors, axis=1):
+        if axis != 1:
+            raise NotImplementedError("Concat currently only supported along channel dimension (axis 1)")
+        self.inputs = tuple(tensors)
+        batch = tensors[0].shape[0]
+        H = tensors[0].shape[2]
+        W = tensors[0].shape[3]
+        spatial_size = H * W
+        
+        total_C = sum(t.shape[1] for t in tensors)
+        out_size = batch * total_C * spatial_size
+        out_handle = lib.CreateBuffer(None, out_size)
+        
+        c_offset = 0
+        self.c_offsets = []
+        for t in tensors:
+            self.c_offsets.append(c_offset)
+            c_in = t.shape[1]
+            t_size = batch * c_in * spatial_size
+            _dispatch(b"concat_insert", (t.gpu_buf,), (out_handle,),
+                      (t_size+255)//256, 1, 1,
+                      u1=batch, u2=c_in, u3=spatial_size, u4=total_C, u5=c_offset, cbSize=20)
+            c_offset += c_in
+            
+        res = Tensor.from_gpu(out_handle, (batch, total_C, H, W), requires_grad=any(t.requires_grad for t in tensors))
+        res._ctx = self
+        return res
+        
+    def backward(self, grad_output):
+        batch, total_C, H, W = grad_output.shape
+        spatial_size = H * W
+        
+        for t, c_offset in zip(self.inputs, self.c_offsets):
+            if t.requires_grad:
+                c_in = t.shape[1]
+                t_size = batch * c_in * spatial_size
+                out_handle = lib.CreateBuffer(None, t_size)
+                _dispatch(b"slice", (grad_output.gpu_buf,), (out_handle,),
+                          (t_size+255)//256, 1, 1,
+                          u1=batch, u2=c_in, u3=spatial_size, u4=total_C, u5=c_offset, cbSize=20)
+                t._accumulate_grad(Tensor.from_gpu(out_handle, t.shape, track=True))
+
 class SoftmaxCEFunc(Function):
     def forward(self, x, labels):
         self.inputs = (x, labels)
@@ -753,15 +867,83 @@ class SoftmaxCEFunc(Function):
                   (num_classes+15)//16, (batch_size+15)//16, 1, u1=batch_size, u2=num_classes)
         x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
 
+class DiceLossFunc(Function):
+    def forward(self, pred, target):
+        self.inputs = (pred, target)
+        batch = pred.shape[0]
+        size = pred.size // batch
+        out_handle = lib.CreateBuffer(None, batch)
+        # Parallel reduction: one thread group per batch element
+        _dispatch(b"dice_loss", (pred.gpu_buf, target.gpu_buf), (out_handle,),
+                  batch, 1, 1, u1=batch, u2=size)
+        res = Tensor.from_gpu(out_handle, (batch,), requires_grad=True)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        pred, target = self.inputs
+        batch = pred.shape[0]
+        size = pred.size // batch
+        # Pass 1: compute per-batch sums (intersection, sum_pred, sum_target)
+        sums_handle = lib.CreateBuffer(None, batch * 3)
+        _dispatch(b"dice_loss_sums", (pred.gpu_buf, target.gpu_buf), (sums_handle,),
+                  batch, 1, 1, u1=batch, u2=size)
+        # Pass 2: compute per-element gradients using precomputed sums
+        out_handle = lib.CreateBuffer(None, pred.size)
+        _dispatch(b"dice_loss_grad", (pred.gpu_buf, target.gpu_buf, sums_handle), (out_handle,),
+                  (pred.size+255)//256, 1, 1, u1=batch, u2=size)
+        lib.ReleaseBuffer(sums_handle)
+        grad_tensor = Tensor.from_gpu(out_handle, pred.shape, track=True)
+        pred._accumulate_grad(grad_tensor)
+
 def matmul(A, B, transA=False, transB=False): return MatMul().forward(A, B, transA, transB)
 def add_bias(A, B): return AddBias().forward(A, B)
 def bias_relu(A, B): return BiasReLUFunc().forward(A, B)
 def relu(x): return ReLUFunc().forward(x)
 def relu6(x): return ReLU6Func().forward(x)
+def sigmoid(x): return SigmoidFunc().forward(x)
 def softmax_ce(x, labels): return SoftmaxCEFunc().forward(x, labels)
 def conv2d(x, f, b, stride=1, padding=0, actType=0): return Conv2D().forward(x, f, b, stride, padding, actType)
 def maxpool2d(x, pool_size=2, stride=2): return MaxPool2D().forward(x, pool_size, stride)
 def flatten(x): return Flatten().forward(x)
+def leaky_relu(x, alpha=0.1): return LeakyReLUFunc().forward(x, alpha)
+def upsample2d(x, scaleH=2, scaleW=2): return UpSample2D().forward(x, scaleH, scaleW)
+def concat(tensors, axis=1): return Concat().forward(tensors, axis)
+def dice_loss(pred, target): return DiceLossFunc().forward(pred, target)
+
+def clip_grad_norm(params, max_norm=1.0):
+    """Clips gradient norm (matching PyTorch clip_grad_norm_).
+    CPU fallback: syncs all grads to CPU, computes norm, re-uploads.
+    Use sgd_step_clipped() instead for GPU-side fused clip+SGD.
+    """
+    total_norm_sq = 0.0
+    grad_data = []
+    for p in params:
+        if p.grad is not None and p.grad.gpu_buf is not None:
+            g = p.grad.sync()
+            grad_data.append(g)
+            total_norm_sq += float(np.sum(g * g))
+        else:
+            grad_data.append(None)
+    total_norm = float(np.sqrt(total_norm_sq))
+    if total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for p, g in zip(params, grad_data):
+            if g is not None:
+                p.grad.upload(g * scale)
+    return total_norm
+
+def sgd_step_clipped(params, lr, max_norm=1.0):
+    """Fused GPU-side gradient clipping + SGD update.
+    Computes grad norm, clips, and updates weights entirely on GPU.
+    Only reads back 1 float (the norm) instead of all parameters.
+    Returns the total gradient norm.
+    """
+    n = len(params)
+    pa = (ctypes.c_void_p * n)(*[p.gpu_buf for p in params])
+    ga = (ctypes.c_void_p * n)(*[p.grad.gpu_buf for p in params])
+    sa = (ctypes.c_uint * n)(*[p.size for p in params])
+    return float(lib.SGDBatchClipped(pa, ga, sa, n, lr, max_norm))
 
 def scale_add(A, B, alpha=1.0, beta=1.0):
     out_handle = lib.CreateBuffer(None, A.size)
@@ -1858,4 +2040,5 @@ class ComputeGraph:
         self._compiled = False
     
     def __del__(self):
+        self.release()
         self.release()

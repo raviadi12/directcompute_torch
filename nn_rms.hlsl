@@ -1,6 +1,6 @@
 cbuffer Params : register(b0) { uint count; uint pad[3]; };
 StructuredBuffer<float> A : register(t0);
-RWStructuredBuffer<float> out : register(u0);
+RWStructuredBuffer<float> output_buf : register(u0);
 
 groupshared float s_sum[256];
 
@@ -20,6 +20,6 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint ti : SV_GroupIndex) {
     }
     
     if (ti == 0) {
-        out[0] = sqrt(s_sum[0] / count);
+        output_buf[0] = sqrt(s_sum[0] / count);
     }
 }

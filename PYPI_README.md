@@ -383,6 +383,29 @@ print("Training complete!")
 
 ### Benchmark Results (PetImages Cat vs Dog, Intel Xe iGPU)
 
+---
+
+## Changelog
+
+### v0.2.0 — GPU-Side Performance Optimizations
+
+Major GPU performance improvements reducing per-batch time on segmentation workloads:
+
+**Dice Loss — 2-pass parallel backward (was O(N²), now O(1) per thread)**
+- `nn_dice_loss.hlsl` rewritten with 256-thread shared-memory reduction; dispatch is `(batch, 1, 1)` instead of a single serial thread
+- `nn_dice_loss_grad.hlsl` rewritten to a two-pass approach: pre-compute per-batch `{intersection, sum_pred, sum_target}` sums in a new Pass 1 shader (`nn_dice_loss_sums.hlsl`), then each backward thread reads directly from that buffer — eliminating the ~19ms O(N²) loop entirely
+
+**GPU-side gradient clipping — eliminates 30+ CopyResource stalls**
+- New `sgd_step_clipped(params, lr, max_norm)` function: gradient norm computation and SGD weight update are fully GPU-resident
+- Three new shaders: `nn_grad_sq_reduce.hlsl` (per-param ² partial sums), `nn_grad_norm_final.hlsl` (total norm + clip scale), `nn_sgd_clipped.hlsl` (scaled weight update)
+- New C++ function `SGDBatchClipped` in `engine.cpp`: only 1 GPU→CPU readback (the norm scalar) vs. 1 readback per parameter previously
+
+**New and updated shaders in this release:**
+`nn_dice_loss_sums.hlsl`, `nn_grad_sq_reduce.hlsl`, `nn_grad_norm_final.hlsl`, `nn_sgd_clipped.hlsl`, plus updated `nn_dice_loss.hlsl` and `nn_dice_loss_grad.hlsl`
+
+### v0.1.9 and earlier
+See [GitHub releases](https://github.com/raviadi12/directcompute_torch/releases) for full history.
+
 | | DirectCompute (iGPU) | PyTorch (CPU) |
 |--|--|--|
 | Feature extraction (1600 imgs) | **41.7s** | 43.1s |

@@ -1,7 +1,9 @@
 import os
+import sys
 import numpy as np
 from PIL import Image
 import time
+import rdoc_helper
 from nn_engine import (Tensor, Linear, ConvLayer, Model, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
                        bias_relu, get_pool_stats, get_pool_memory)
@@ -92,6 +94,8 @@ def train_alexnet():
     print(f"  Batch size: {batch_size}, Accum steps: {accum_steps}, Effective batch: {batch_size * accum_steps}")
     start = time.time()
 
+    rdoc = rdoc_helper.get_rdoc_api()
+
     for epoch in range(epochs):
         # ── Train ──
         metrics.reset()
@@ -106,6 +110,11 @@ def train_alexnet():
             xb = Tensor(X_train[i:end], track=True)
             yb = Tensor(Y_train[i:end], track=True)
 
+            # RenderDoc capture first batch
+            if epoch == 0 and i == 0 and rdoc:
+                print(">>> STARTING RENDERDOC CAPTURE <<<")
+                rdoc.StartFrameCapture(None, None)
+
             logits = forward(xb)
             loss = softmax_ce(logits, yb)
             metrics.update(loss, logits, yb)
@@ -115,6 +124,12 @@ def train_alexnet():
             if step_count % accum_steps == 0 or end >= len(X_train):
                 optimizer.step(clip=1.0)
                 end_batch()
+
+            # RenderDoc end capture
+            if epoch == 0 and i == 0 and rdoc:
+                rdoc.EndFrameCapture(None, None)
+                print(">>> CAPTURE COMPLETE! Check the RenderDoc UI. <<<")
+                sys.exit(0)
 
         train_loss, train_acc = metrics.collect(len(X_train))
 

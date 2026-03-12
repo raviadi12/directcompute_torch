@@ -2,6 +2,8 @@ import os
 import numpy as np
 from PIL import Image
 import time
+import sys # <-- Added for exiting
+import rdoc_helper # <-- Added our helper
 from nn_engine import (Tensor, Linear, ConvLayer, Model, SGD, Metrics,
                        relu, softmax_ce, maxpool2d, flatten, end_batch,
                        bias_relu, auto_warm, get_pool_stats,
@@ -76,16 +78,22 @@ def train_lenet():
     print("\nStarting LeNet training on DirectCompute GPU...")
     start = time.time()
 
+    rdoc = rdoc_helper.get_rdoc_api()
+
     for epoch in range(epochs):
         # ── Train ──
         model.train()
         metrics.reset()
         for i in range(0, len(X_train), batch_size):
+
+
             end = min(i + batch_size, len(X_train))
             optimizer.zero_grad()
             xb = Tensor(X_train[i:end])
             yb = Tensor(Y_train[i:end])
-
+            if epoch == 0 and i == 0 and rdoc:
+                print(">>> STARTING RENDERDOC CAPTURE <<<")
+                rdoc.StartFrameCapture(None, None)
             logits = model(xb)
             loss = softmax_ce(logits, yb)
             metrics.update(loss, logits, yb)
@@ -93,6 +101,11 @@ def train_lenet():
             loss.backward()
             optimizer.step(clip=1.0)
             end_batch()
+
+            if epoch == 0 and i == 0 and rdoc:
+                rdoc.EndFrameCapture(None, None)
+                print(">>> CAPTURE COMPLETE! Check the RenderDoc UI. <<<")
+                sys.exit(0) # Stop immediately so we don't capture more data
 
         train_loss, train_acc = metrics.collect(len(X_train))
 
