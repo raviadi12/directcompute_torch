@@ -5,11 +5,13 @@ import sys
 from PIL import Image
 import struct
 import time
+import hashlib
 
 def float_to_uint(f):
     return struct.unpack('I', struct.pack('f', f))[0]
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CUSTOM_SHADER_CACHE_DIR = os.path.join(_MODULE_DIR, ".shader_cache")
 
 
 def _resource_dirs():
@@ -40,6 +42,8 @@ def _find_resource(name):
 lib = ctypes.CDLL(_find_resource("engine.dll"))
 lib.InitEngine.restype = ctypes.c_bool
 lib.CompileShader.argtypes = [ctypes.c_char_p, ctypes.c_wchar_p]
+lib.CompileShaderEx.argtypes = [ctypes.c_char_p, ctypes.c_wchar_p, ctypes.c_char_p]
+lib.CompileShaderEx.restype = ctypes.c_bool
 lib.CreateBuffer.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_uint]
 lib.CreateBuffer.restype = ctypes.c_void_p
 lib.AddRefBuffer.argtypes = [ctypes.c_void_p]
@@ -149,10 +153,14 @@ shaders = ["matmul_universal", "matmul_coarsened", "add_bias", "relu", "relu_gra
            "adam", "scale_add", "rms",
            "depthwise_conv_forward", "depthwise_conv_backward_input", "depthwise_conv_backward_filter",
            "global_avg_pool", "global_avg_pool_backward", "add",
-           "relu6", "relu6_grad", "leaky_relu", "leaky_relu_grad",
+           "relu6", "relu6_grad", "leaky_relu", "leaky_relu_grad", "gelu", "gelu_grad",
            "upsample", "upsample_backward", "concat_insert", "slice",
            "dice_loss", "dice_loss_grad", "sigmoid", "sigmoid_grad",
            "matmul_reduce",
+           "layernorm_forward", "causal_masked_softmax", "attention_forward",
+           "layernorm_backward_param", "layernorm_backward_dx",
+           "attention_forward_train", "attention_backward_dq", "attention_backward_dk", "attention_backward_dv",
+           "attention_forward_full_train", "attention_backward_full_dq", "attention_backward_full_dk", "attention_backward_full_dv",
            "dice_loss_sums", "grad_sq_reduce", "grad_norm_final", "sgd_clipped"]
 for s in shaders:
     lib.CompileShader(s.encode(), _find_resource(f"nn_{s}.hlsl"))
@@ -345,6 +353,102 @@ class CPUProfiler:
 cpu_profiler = CPUProfiler()
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _pack_custom_constants(constants):
+    """Pack Python scalars into a raw constant-buffer payload (4 bytes each)."""
+    payload = bytearray()
+    for value in constants:
+        if isinstance(value, bool):
+            payload.extend(struct.pack("<I", 1 if value else 0))
+        elif isinstance(value, int):
+            payload.extend(struct.pack("<I", value & 0xFFFFFFFF))
+        elif isinstance(value, float):
+            payload.extend(struct.pack("<f", value))
+        else:
+            raise TypeError(f"Unsupported constant type: {type(value)}")
+    return bytes(payload)
+
+
+class CustomShader:
+    """JIT-compile and dispatch custom compute shaders with process-level caching.
+
+    Notes:
+    - Bindings follow engine convention: inputs -> SRV tN, outputs -> UAV uN.
+    """
+
+    _compiled = {}  # (entry_point, digest) -> shader_name(bytes)
+
+    def __init__(self, hlsl_src, entry_point="CSMain", debug_name=None):
+        if not isinstance(hlsl_src, str) or not hlsl_src.strip():
+            raise ValueError("hlsl_src must be a non-empty string")
+        if not isinstance(entry_point, str) or not entry_point.strip():
+            raise ValueError("entry_point must be a non-empty string")
+        entry_point = entry_point.strip()
+
+        digest = hashlib.sha256((entry_point + "\n" + hlsl_src).encode("utf-8")).hexdigest()
+        key = (entry_point, digest)
+        if key in CustomShader._compiled:
+            self._shader_name = CustomShader._compiled[key]
+            return
+
+        os.makedirs(_CUSTOM_SHADER_CACHE_DIR, exist_ok=True)
+        hlsl_path = os.path.join(_CUSTOM_SHADER_CACHE_DIR, f"jit_{digest}.hlsl")
+        if not os.path.exists(hlsl_path):
+            with open(hlsl_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hlsl_src)
+
+        label = debug_name.strip() if isinstance(debug_name, str) and debug_name.strip() else "jit"
+        label = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in label)
+        shader_name_str = f"{label}_{digest[:24]}"
+        shader_name = shader_name_str.encode("ascii")
+
+        ok = lib.CompileShaderEx(shader_name, hlsl_path, entry_point.encode("ascii"))
+        if not ok:
+            raise RuntimeError(f"Failed to compile custom shader: {hlsl_path}")
+
+        CustomShader._compiled[key] = shader_name
+        self._shader_name = shader_name
+
+    def dispatch(self, grid, inputs=None, outputs=None, constants=None):
+        if len(grid) != 3:
+            raise ValueError("grid must be a tuple/list of 3 ints: (x, y, z)")
+        gx, gy, gz = int(grid[0]), int(grid[1]), int(grid[2])
+        if gx <= 0 or gy <= 0 or gz <= 0:
+            raise ValueError("grid dimensions must be positive")
+
+        inputs = [] if inputs is None else list(inputs)
+        outputs = [] if outputs is None else list(outputs)
+        if len(inputs) > 16 or len(outputs) > 16:
+            raise ValueError("engine supports up to 16 SRVs and 16 UAVs per dispatch")
+
+        for i, t in enumerate(inputs):
+            if not isinstance(t, Tensor):
+                raise TypeError(f"inputs[{i}] must be a Tensor")
+        for i, t in enumerate(outputs):
+            if not isinstance(t, Tensor):
+                raise TypeError(f"outputs[{i}] must be a Tensor")
+
+        n_s = len(inputs)
+        n_u = len(outputs)
+        srv_arr = (ctypes.c_void_p * n_s)(*(t.gpu_buf for t in inputs)) if n_s else None
+        uav_arr = (ctypes.c_void_p * n_u)(*(t.gpu_buf for t in outputs)) if n_u else None
+        threads = (ctypes.c_uint * 3)(gx, gy, gz)
+
+        cb_ptr = None
+        cb_size = 0
+        cb_buf = None
+        if constants is not None:
+            if isinstance(constants, (bytes, bytearray)):
+                payload = bytes(constants)
+            else:
+                payload = _pack_custom_constants(constants)
+            if payload:
+                cb_size = len(payload)
+                cb_buf = ctypes.create_string_buffer(payload, cb_size)
+                cb_ptr = ctypes.cast(cb_buf, ctypes.c_void_p)
+
+        lib.RunShader(self._shader_name, srv_arr, n_s, uav_arr, n_u, threads, cb_ptr, cb_size)
+
 # ── Pre-allocated ctypes arrays for fast dispatch (avoid per-call allocation) ──
 _srv_arr = (ctypes.c_void_p * 8)()
 _uav_arr = (ctypes.c_void_p * 8)()
@@ -411,7 +515,7 @@ def _shape_size(shape):
     return s
 
 class Tensor:
-    __slots__ = ['data', 'shape', 'size', 'requires_grad', 'grad', 'gpu_buf', '_ctx']
+    __slots__ = ['data', 'shape', 'size', 'requires_grad', 'grad', 'gpu_buf', '_ctx', '_cached_topo']
 
     def __init__(self, data, requires_grad=False, track=True):
         if isinstance(data, np.ndarray):
@@ -444,6 +548,15 @@ class Tensor:
         if track: _all_tensors.append(t)
         return t
 
+    @classmethod
+    def empty(cls, shape, requires_grad=False, track=True):
+        return cls(np.empty(shape, dtype=np.float32), requires_grad=requires_grad, track=track)
+
+    @classmethod
+    def empty_like(cls, other, requires_grad=None, track=True):
+        req = other.requires_grad if requires_grad is None else bool(requires_grad)
+        return cls.empty(other.shape, requires_grad=req, track=track)
+
     def sync(self):
         if self.gpu_buf:
             if self.data is None:
@@ -463,27 +576,30 @@ class Tensor:
         if grad is None:
             grad = Tensor(np.ones(self.shape, dtype=np.float32), track=False)
         self.grad = grad
-        # Iterative topological sort (avoids Python recursion overhead)
-        topo = []
-        visited = set()
-        stack = [self]
-        while stack:
-            v = stack[-1]
-            if v in visited:
-                stack.pop()
-                continue
-            # Check if all children visited
-            children_done = True
-            if v._ctx:
-                for i in v._ctx.inputs:
-                    if isinstance(i, Tensor) and i.requires_grad and i not in visited:
-                        stack.append(i)
-                        children_done = False
-            if children_done:
-                visited.add(v)
-                stack.pop()
-                topo.append(v)
-        for v in reversed(topo):
+        
+        # Check if we already cached the topological sort for this graph
+        if not hasattr(self, '_cached_topo'):
+            topo = []
+            visited = set()
+            stack = [self]
+            while stack:
+                v = stack[-1]
+                if v in visited:
+                    stack.pop()
+                    continue
+                children_done = True
+                if v._ctx:
+                    for i in v._ctx.inputs:
+                        if isinstance(i, Tensor) and i.requires_grad and i not in visited:
+                            stack.append(i)
+                            children_done = False
+                if children_done:
+                    visited.add(v)
+                    stack.pop()
+                    topo.append(v)
+            self._cached_topo = topo
+            
+        for v in reversed(self._cached_topo):
             if v._ctx and v.grad is not None: v._ctx.backward(v.grad)
 
     def _accumulate_grad(self, grad):
@@ -496,6 +612,266 @@ class Tensor:
 class Function:
     def __init__(self, *inputs): self.inputs = inputs
     def backward(self, grad_output): raise NotImplementedError
+
+
+class _CustomUnaryBackward(Function):
+    """Backward context for custom unary shader ops.
+
+    Backward shader contract:
+    - SRV t0: original input x
+    - SRV t1: upstream gradient dOut
+    - UAV u0: output gradient dX
+    """
+
+    def __init__(self, x, backward_shader, threads_per_group, backward_constants=None):
+        super().__init__(x)
+        self.backward_shader = backward_shader
+        self.threads_per_group = int(threads_per_group)
+        self.backward_constants = backward_constants
+
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        dx = Tensor.empty_like(x, requires_grad=False, track=True)
+        groups = (x.size + self.threads_per_group - 1) // self.threads_per_group
+        self.backward_shader.dispatch(
+            grid=(groups, 1, 1),
+            inputs=[x, grad_output],
+            outputs=[dx],
+            constants=self.backward_constants,
+        )
+        x._accumulate_grad(dx)
+
+
+def custom_unary(x, forward_shader, backward_shader=None, threads_per_group=256,
+                 forward_constants=None, backward_constants=None):
+    """Run a custom unary shader op, with optional custom backward shader.
+
+    Forward shader contract:
+    - SRV t0: input x
+    - UAV u0: output y
+
+    Backward shader contract (if provided):
+    - SRV t0: original input x
+    - SRV t1: upstream gradient dOut
+    - UAV u0: output gradient dX
+    """
+    if not isinstance(x, Tensor):
+        raise TypeError("x must be a Tensor")
+    if not isinstance(forward_shader, CustomShader):
+        raise TypeError("forward_shader must be a CustomShader")
+    if backward_shader is not None and not isinstance(backward_shader, CustomShader):
+        raise TypeError("backward_shader must be a CustomShader or None")
+
+    tpg = int(threads_per_group)
+    if tpg <= 0:
+        raise ValueError("threads_per_group must be > 0")
+
+    out = Tensor.empty_like(x, requires_grad=x.requires_grad, track=True)
+    groups = (x.size + tpg - 1) // tpg
+    forward_shader.dispatch(
+        grid=(groups, 1, 1),
+        inputs=[x],
+        outputs=[out],
+        constants=forward_constants,
+    )
+
+    if x.requires_grad and backward_shader is not None:
+        out._ctx = _CustomUnaryBackward(x, backward_shader, tpg, backward_constants)
+    return out
+
+
+class CustomUnaryShader:
+    """Convenience wrapper bundling forward/backward custom unary shaders."""
+
+    def __init__(self, forward_hlsl, backward_hlsl=None, forward_entry="CSMain", backward_entry="CSMain",
+                 threads_per_group=256, forward_constants=None, backward_constants=None, debug_name="custom_unary"):
+        self.forward_shader = CustomShader(forward_hlsl, entry_point=forward_entry, debug_name=f"{debug_name}_fwd")
+        self.backward_shader = None
+        if backward_hlsl is not None:
+            self.backward_shader = CustomShader(backward_hlsl, entry_point=backward_entry, debug_name=f"{debug_name}_bwd")
+        self.threads_per_group = int(threads_per_group)
+        self.forward_constants = forward_constants
+        self.backward_constants = backward_constants
+
+    def __call__(self, x):
+        return custom_unary(
+            x,
+            self.forward_shader,
+            backward_shader=self.backward_shader,
+            threads_per_group=self.threads_per_group,
+            forward_constants=self.forward_constants,
+            backward_constants=self.backward_constants,
+        )
+
+
+def grid_1d(numel, threads_per_group=256):
+    """Helper for 1D dispatch grids."""
+    tpg = int(threads_per_group)
+    if tpg <= 0:
+        raise ValueError("threads_per_group must be > 0")
+    n = int(numel)
+    if n <= 0:
+        raise ValueError("numel must be > 0")
+    return ((n + tpg - 1) // tpg, 1, 1)
+
+
+def grid_2d(width, height, tile_x=16, tile_y=16):
+    """Helper for 2D dispatch grids."""
+    w = int(width)
+    h = int(height)
+    tx = int(tile_x)
+    ty = int(tile_y)
+    if w <= 0 or h <= 0:
+        raise ValueError("width/height must be > 0")
+    if tx <= 0 or ty <= 0:
+        raise ValueError("tile_x/tile_y must be > 0")
+    return ((w + tx - 1) // tx, (h + ty - 1) // ty, 1)
+
+
+def _resolve_grid(grid, inputs, output, grad_output=None, input_index=None):
+    if callable(grid):
+        g = grid(inputs, output, grad_output, input_index)
+    else:
+        g = grid
+    if g is None or len(g) != 3:
+        raise ValueError("grid must be a 3-tuple or callable returning a 3-tuple")
+    gx, gy, gz = int(g[0]), int(g[1]), int(g[2])
+    if gx <= 0 or gy <= 0 or gz <= 0:
+        raise ValueError("grid dimensions must be positive")
+    return (gx, gy, gz)
+
+
+def _resolve_backward_item(values, idx):
+    if values is None:
+        return None
+    if isinstance(values, (list, tuple)):
+        if idx >= len(values):
+            return None
+        return values[idx]
+    return values
+
+
+class _CustomOpBackward(Function):
+    """Generic backward context for multi-input custom ops.
+
+    Backward shader contract for input i:
+    - SRVs t0..t{N-1}: original forward inputs
+    - SRV tN: upstream gradient dOut
+    - UAV u0: gradient for input i (dInput_i)
+    """
+
+    def __init__(self, inputs, output, backward_shaders, backward_grid, backward_constants):
+        super().__init__(*inputs)
+        self.output = output
+        self.backward_shaders = list(backward_shaders) if backward_shaders is not None else []
+        self.backward_grid = backward_grid
+        self.backward_constants = backward_constants
+
+    def backward(self, grad_output):
+        inputs = self.inputs
+        n = len(inputs)
+        for i in range(n):
+            x = inputs[i]
+            if not isinstance(x, Tensor) or not x.requires_grad:
+                continue
+            shader = _resolve_backward_item(self.backward_shaders, i)
+            if shader is None:
+                continue
+            if not isinstance(shader, CustomShader):
+                raise TypeError(f"backward_shaders[{i}] must be CustomShader or None")
+
+            dx = Tensor.empty_like(x, requires_grad=False, track=True)
+            g = _resolve_grid(self.backward_grid, inputs, self.output, grad_output, i)
+            bconst = _resolve_backward_item(self.backward_constants, i)
+            shader.dispatch(
+                grid=g,
+                inputs=list(inputs) + [grad_output],
+                outputs=[dx],
+                constants=bconst,
+            )
+            x._accumulate_grad(dx)
+
+
+def custom_op(inputs, output_shape, forward_shader, forward_grid,
+              forward_constants=None, backward_shaders=None,
+              backward_grid=None, backward_constants=None):
+    """Generic custom layer primitive for multi-input ops.
+
+    Forward shader contract:
+    - SRVs t0..t{N-1}: input tensors
+    - UAV u0: output tensor
+
+    Backward shader contract (per input i, optional):
+    - SRVs t0..t{N-1}: original input tensors
+    - SRV tN: upstream gradient dOut
+    - UAV u0: dInput_i
+    """
+    inputs = list(inputs)
+    if not inputs:
+        raise ValueError("inputs must contain at least one Tensor")
+    for i, t in enumerate(inputs):
+        if not isinstance(t, Tensor):
+            raise TypeError(f"inputs[{i}] must be a Tensor")
+    if not isinstance(forward_shader, CustomShader):
+        raise TypeError("forward_shader must be a CustomShader")
+
+    output_shape = tuple(int(d) for d in output_shape)
+    if not output_shape:
+        raise ValueError("output_shape must be a non-empty shape tuple")
+    out_requires_grad = any(t.requires_grad for t in inputs)
+    out = Tensor.empty(output_shape, requires_grad=out_requires_grad, track=True)
+
+    g = _resolve_grid(forward_grid, inputs, out)
+    forward_shader.dispatch(
+        grid=g,
+        inputs=inputs,
+        outputs=[out],
+        constants=forward_constants,
+    )
+
+    if out_requires_grad and backward_shaders is not None:
+        bgrid = forward_grid if backward_grid is None else backward_grid
+        out._ctx = _CustomOpBackward(inputs, out, backward_shaders, bgrid, backward_constants)
+    return out
+
+
+class CustomLayerOp:
+    """Compile-once wrapper for generic multi-input custom ops."""
+
+    def __init__(self, forward_hlsl, backward_hlsl_list=None,
+                 forward_entry="CSMain", backward_entry_list=None,
+                 debug_name="custom_layer"):
+        self.forward_shader = CustomShader(forward_hlsl, entry_point=forward_entry, debug_name=f"{debug_name}_fwd")
+
+        self.backward_shaders = None
+        if backward_hlsl_list is not None:
+            b_entries = backward_entry_list
+            if b_entries is None:
+                b_entries = ["CSMain"] * len(backward_hlsl_list)
+            if len(b_entries) != len(backward_hlsl_list):
+                raise ValueError("backward_entry_list must match backward_hlsl_list length")
+
+            self.backward_shaders = []
+            for i, hlsl in enumerate(backward_hlsl_list):
+                if hlsl is None:
+                    self.backward_shaders.append(None)
+                else:
+                    self.backward_shaders.append(
+                        CustomShader(hlsl, entry_point=b_entries[i], debug_name=f"{debug_name}_bwd{i}")
+                    )
+
+    def __call__(self, inputs, output_shape, forward_grid,
+                 forward_constants=None, backward_grid=None, backward_constants=None):
+        return custom_op(
+            inputs=inputs,
+            output_shape=output_shape,
+            forward_shader=self.forward_shader,
+            forward_grid=forward_grid,
+            forward_constants=forward_constants,
+            backward_shaders=self.backward_shaders,
+            backward_grid=backward_grid,
+            backward_constants=backward_constants,
+        )
 
 # Matmul dispatch helper — GPU-adaptive
 _TILE_U = 16  # Universal shader tile size (always 16)
@@ -521,6 +897,8 @@ class MatMul(Function):
         self.inputs = (A, B)
         self.transA = transA
         self.transB = transB
+        self.A_shape = A.shape
+        self.B_shape = B.shape
         flags = (1 if transA else 0) | (2 if transB else 0)
         
         M = A.shape[1] if transA else A.shape[0]
@@ -534,19 +912,43 @@ class MatMul(Function):
         
     def backward(self, grad_output):
         A, B = self.inputs
+        # Let Y = op(A) @ op(B), with op(X)=X or X^T from trans flags.
+        # We compute gradients directly into raw A/B layouts for each flag combo.
+
+        # Raw shapes.
+        a0, a1 = self.A_shape
+        b0, b1 = self.B_shape
+        # Output shape Y: (M, N)
+        M, N = grad_output.shape
+
         if A.requires_grad:
-            # If C = A @ B, then dA = dC @ B^T
-            # If C = A^T @ B, then dA = B @ dC^T
-            flags_A = 2 if not self.transB else 0
-            M_A, K_A, N_A = grad_output.shape[0], B.shape[1], B.shape[0]
-            out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, M_A, K_A, N_A, flags_A)
+            if not self.transA and not self.transB:
+                # dA = dY @ B^T, shapes: (M,N) @ (N,K=a1) -> (M,a1)
+                out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, M, N, a1, 2)
+            elif not self.transA and self.transB:
+                # dA = dY @ B, shapes: (M,N=b0) @ (b0,K=b1) -> (M,b1=a1)
+                out_handle = lib.MatMulAlloc(grad_output.gpu_buf, B.gpu_buf, M, N, b1, 0)
+            elif self.transA and not self.transB:
+                # dA = B @ dY^T, shapes: (K=a0,N) @ (N,M=a1) -> (a0,a1)
+                out_handle = lib.MatMulAlloc(B.gpu_buf, grad_output.gpu_buf, a0, N, a1, 2)
+            else:
+                # dA = B^T @ dY^T, shapes: (K=a0,N) @ (N,M=a1) -> (a0,a1)
+                out_handle = lib.MatMulAlloc(B.gpu_buf, grad_output.gpu_buf, a0, N, a1, 3)
             A._accumulate_grad(Tensor.from_gpu(out_handle, A.shape, track=True))
-            
+
         if B.requires_grad:
-            # If C = A @ B, then dB = A^T @ dC
-            flags_B = 1 if not self.transA else 0
-            M_B, K_B, N_B = A.shape[1], A.shape[0], grad_output.shape[1]
-            out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, M_B, K_B, N_B, flags_B)
+            if not self.transA and not self.transB:
+                # dB = A^T @ dY, shapes: (K=a1,M) @ (M,N) -> (a1,N=b1)
+                out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, a1, a0, N, 1)
+            elif not self.transA and self.transB:
+                # dB = dY^T @ A, shapes: (N=b0,M) @ (M,K=a1) -> (b0,a1)
+                out_handle = lib.MatMulAlloc(grad_output.gpu_buf, A.gpu_buf, b0, a0, a1, 1)
+            elif self.transA and not self.transB:
+                # dB = A @ dY, shapes: (K=a0,M) @ (M,N=b1) -> (a0,b1)
+                out_handle = lib.MatMulAlloc(A.gpu_buf, grad_output.gpu_buf, a0, a1, b1, 0)
+            else:
+                # dB = dY^T @ A^T, shapes: (N=b0,M) @ (M,K=b1) -> (b0,b1)
+                out_handle = lib.MatMulAlloc(grad_output.gpu_buf, A.gpu_buf, b0, a1, b1, 3)
             B._accumulate_grad(Tensor.from_gpu(out_handle, B.shape, track=True))
 
 class Conv2D(Function):
@@ -773,6 +1175,24 @@ class LeakyReLUFunc(Function):
                       (x.size+255)//256, 1, 1, u1=x.size, u2=float_to_uint(self.alpha))
             x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
 
+class GELUFunc(Function):
+    def forward(self, x):
+        self.inputs = (x,)
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"gelu", (x.gpu_buf,), (out_handle,),
+                  (x.size + 255) // 256, 1, 1, u1=x.size)
+        res = Tensor.from_gpu(out_handle, x.shape, requires_grad=x.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        x = self.inputs[0]
+        if x.requires_grad:
+            out_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"gelu_grad", (grad_output.gpu_buf, x.gpu_buf), (out_handle,),
+                      (x.size + 255) // 256, 1, 1, u1=x.size)
+            x._accumulate_grad(Tensor.from_gpu(out_handle, x.shape, track=True))
+
 class UpSample2D(Function):
     def forward(self, x, scaleH=2, scaleW=2):
         self.inputs = (x,)
@@ -901,6 +1321,7 @@ def add_bias(A, B): return AddBias().forward(A, B)
 def bias_relu(A, B): return BiasReLUFunc().forward(A, B)
 def relu(x): return ReLUFunc().forward(x)
 def relu6(x): return ReLU6Func().forward(x)
+def gelu(x): return GELUFunc().forward(x)
 def sigmoid(x): return SigmoidFunc().forward(x)
 def softmax_ce(x, labels): return SoftmaxCEFunc().forward(x, labels)
 def conv2d(x, f, b, stride=1, padding=0, actType=0): return Conv2D().forward(x, f, b, stride, padding, actType)
@@ -1068,6 +1489,199 @@ class GlobalAvgPool2DFunc(Function):
 
 def global_avg_pool2d(x): return GlobalAvgPool2DFunc().forward(x)
 
+
+class LayerNormForwardFunc(Function):
+    """GPU LayerNorm forward for rank-2 tensors shaped (rows, cols)."""
+    def forward(self, x, gamma, beta, eps=1e-5):
+        if len(x.shape) != 2:
+            raise ValueError("layernorm_forward currently expects x with shape (rows, cols)")
+        if len(gamma.shape) != 1 or len(beta.shape) != 1:
+            raise ValueError("layernorm_forward expects gamma/beta with shape (cols,)")
+        rows, cols = x.shape
+        if gamma.shape[0] != cols or beta.shape[0] != cols:
+            raise ValueError("gamma and beta size must match x.shape[1]")
+
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"layernorm_forward",
+                  (x.gpu_buf, gamma.gpu_buf, beta.gpu_buf),
+                  (out_handle,),
+                  rows, 1, 1,
+                  u1=rows, u2=cols, u3=float_to_uint(eps), cbSize=16)
+
+        # Forward-only primitive in this phase.
+        return Tensor.from_gpu(out_handle, x.shape, requires_grad=False)
+
+
+class LayerNormFunc(Function):
+    def forward(self, x, gamma, beta, eps=1e-5):
+        if len(x.shape) != 2:
+            raise ValueError("layernorm expects x with shape (rows, cols)")
+        rows, cols = x.shape
+        if gamma.shape != (cols,) or beta.shape != (cols,):
+            raise ValueError("layernorm expects gamma/beta with shape (cols,)")
+
+        self.inputs = (x, gamma, beta)
+        self.rows = rows
+        self.cols = cols
+        self.eps = eps
+
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"layernorm_forward",
+                  (x.gpu_buf, gamma.gpu_buf, beta.gpu_buf),
+                  (out_handle,),
+                  rows, 1, 1,
+                  u1=rows, u2=cols, u3=float_to_uint(eps), cbSize=16)
+
+        res = Tensor.from_gpu(out_handle, x.shape,
+                              requires_grad=x.requires_grad or gamma.requires_grad or beta.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        x, gamma, beta = self.inputs
+        rows, cols = self.rows, self.cols
+
+        if gamma.requires_grad or beta.requires_grad:
+            dgamma_handle = lib.CreateBuffer(None, cols)
+            dbeta_handle = lib.CreateBuffer(None, cols)
+            _dispatch(b"layernorm_backward_param",
+                      (x.gpu_buf, grad_output.gpu_buf),
+                      (dgamma_handle, dbeta_handle),
+                      cols, 1, 1,
+                      u1=rows, u2=cols, u3=float_to_uint(self.eps), cbSize=16)
+            if gamma.requires_grad:
+                gamma._accumulate_grad(Tensor.from_gpu(dgamma_handle, gamma.shape, track=True))
+            else:
+                lib.ReleaseBuffer(dgamma_handle)
+            if beta.requires_grad:
+                beta._accumulate_grad(Tensor.from_gpu(dbeta_handle, beta.shape, track=True))
+            else:
+                lib.ReleaseBuffer(dbeta_handle)
+
+        if x.requires_grad:
+            dx_handle = lib.CreateBuffer(None, x.size)
+            _dispatch(b"layernorm_backward_dx",
+                      (x.gpu_buf, grad_output.gpu_buf, gamma.gpu_buf),
+                      (dx_handle,),
+                      rows, 1, 1,
+                      u1=rows, u2=cols, u3=float_to_uint(self.eps), cbSize=16)
+            x._accumulate_grad(Tensor.from_gpu(dx_handle, x.shape, track=True))
+
+
+class CausalMaskedSoftmaxFunc(Function):
+    """GPU causal masked softmax over a rank-2 score matrix (rows, cols)."""
+    def forward(self, x, seq_len, scale=1.0):
+        if len(x.shape) != 2:
+            raise ValueError("causal_masked_softmax expects x with shape (rows, cols)")
+        rows, cols = x.shape
+        if cols != seq_len:
+            raise ValueError("causal_masked_softmax expects cols == seq_len")
+
+        out_handle = lib.CreateBuffer(None, x.size)
+        _dispatch(b"causal_masked_softmax",
+                  (x.gpu_buf,),
+                  (out_handle,),
+                  rows, 1, 1,
+                  u1=rows, u2=cols, u3=seq_len, u4=float_to_uint(scale), cbSize=16)
+
+        # Forward-only primitive in this phase.
+        return Tensor.from_gpu(out_handle, x.shape, requires_grad=False)
+
+
+class AttentionForwardFunc(Function):
+    """GPU causal self-attention forward.
+
+    q, k, v shape: (batch, heads, tokens, head_dim)
+    output shape:  (batch, heads, tokens, head_dim)
+    """
+    def forward(self, q, k, v):
+        if q.shape != k.shape or q.shape != v.shape:
+            raise ValueError("attention_forward expects q, k, v with identical shapes")
+        if len(q.shape) != 4:
+            raise ValueError("attention_forward expects shape (batch, heads, tokens, head_dim)")
+
+        batch, heads, tokens, head_dim = q.shape
+        out_size = batch * heads * tokens * head_dim
+        out_handle = lib.CreateBuffer(None, out_size)
+        scale = 1.0 / np.sqrt(float(head_dim))
+
+        _dispatch(b"attention_forward",
+                  (q.gpu_buf, k.gpu_buf, v.gpu_buf),
+                  (out_handle,),
+                  (out_size + 255) // 256, 1, 1,
+                  u1=batch, u2=heads, u3=tokens, u4=head_dim, u5=float_to_uint(scale), cbSize=20)
+
+        # Forward-only primitive in this phase.
+        return Tensor.from_gpu(out_handle, q.shape, requires_grad=False)
+
+
+class AttentionCausalFunc(Function):
+    """Differentiable causal attention for q/k/v shaped (B*T, H*D)."""
+    def forward(self, q, k, v, batch, tokens, heads):
+        if q.shape != k.shape or q.shape != v.shape:
+            raise ValueError("attention_causal expects q, k, v with identical shapes")
+        bt, hd = q.shape
+        if bt != batch * tokens:
+            raise ValueError("attention_causal shape mismatch: q.shape[0] must equal batch*tokens")
+        if hd % heads != 0:
+            raise ValueError("attention_causal requires hidden_dim divisible by heads")
+
+        head_dim = hd // heads
+        self.inputs = (q, k, v)
+        self.batch = batch
+        self.tokens = tokens
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale_bits = float_to_uint(1.0 / np.sqrt(float(head_dim)))
+
+        out_handle = lib.CreateBuffer(None, q.size)
+        probs_handle = lib.CreateBuffer(None, batch * heads * tokens * tokens)
+        _dispatch(b"attention_forward_train",
+                  (q.gpu_buf, k.gpu_buf, v.gpu_buf),
+                  (out_handle, probs_handle),
+                  (q.size + 255) // 256, 1, 1,
+                  u1=batch, u2=tokens, u3=heads, u4=head_dim, u5=self.scale_bits, cbSize=20)
+
+        self.probs = Tensor.from_gpu(probs_handle, (batch * heads * tokens, tokens), track=True)
+        res = Tensor.from_gpu(out_handle, q.shape,
+                              requires_grad=q.requires_grad or k.requires_grad or v.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        q, k, v = self.inputs
+        b, t, h, d = self.batch, self.tokens, self.heads, self.head_dim
+        cb_kwargs = dict(u1=b, u2=t, u3=h, u4=d, u5=self.scale_bits, cbSize=20)
+
+        if q.requires_grad:
+            dq_handle = lib.CreateBuffer(None, q.size)
+            _dispatch(b"attention_backward_dq",
+                      (q.gpu_buf, k.gpu_buf, v.gpu_buf, grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dq_handle,),
+                      (q.size + 255) // 256, 1, 1,
+                      **cb_kwargs)
+            q._accumulate_grad(Tensor.from_gpu(dq_handle, q.shape, track=True))
+
+        if k.requires_grad:
+            dk_handle = lib.CreateBuffer(None, k.size)
+            _dispatch(b"attention_backward_dk",
+                      (q.gpu_buf, k.gpu_buf, v.gpu_buf, grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dk_handle,),
+                      (k.size + 255) // 256, 1, 1,
+                      **cb_kwargs)
+            k._accumulate_grad(Tensor.from_gpu(dk_handle, k.shape, track=True))
+
+        if v.requires_grad:
+            dv_handle = lib.CreateBuffer(None, v.size)
+            _dispatch(b"attention_backward_dv",
+                      (grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dv_handle,),
+                      (v.size + 255) // 256, 1, 1,
+                      u1=b, u2=t, u3=h, u4=d, cbSize=20)
+            v._accumulate_grad(Tensor.from_gpu(dv_handle, v.shape, track=True))
+
+        self.probs = None
+
 def rms(A):
     out_handle = lib.CreateBuffer(None, 1)
     _dispatch(b"rms", (A.gpu_buf,), (out_handle,),
@@ -1076,6 +1690,106 @@ def rms(A):
     lib.ReadBuffer(out_handle, v.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
     lib.ReleaseBuffer(out_handle)
     return max(float(v[0]), 1e-8)
+
+
+def layernorm_forward(x, gamma, beta, eps=1e-5):
+    return LayerNormForwardFunc().forward(x, gamma, beta, eps)
+
+
+def layernorm(x, gamma, beta, eps=1e-5):
+    return LayerNormFunc().forward(x, gamma, beta, eps)
+
+
+def causal_masked_softmax(x, seq_len, scale=1.0):
+    return CausalMaskedSoftmaxFunc().forward(x, seq_len, scale)
+
+
+def attention_forward(q, k, v):
+    return AttentionForwardFunc().forward(q, k, v)
+
+
+def attention_causal(q, k, v, batch, tokens, heads):
+    return AttentionCausalFunc().forward(q, k, v, batch, tokens, heads)
+
+
+class AttentionFullFunc(Function):
+    """Differentiable full attention for q shaped (B*TQ, H*D), k/v shaped (B*TK, H*D)."""
+    def forward(self, q, k, v, batch, tokens_q, tokens_k, heads):
+        if k.shape != v.shape:
+            raise ValueError("attention_full expects k and v with identical shapes")
+        btq, hd = q.shape
+        btk, hd_k = k.shape
+        if hd != hd_k:
+            raise ValueError("attention_full expects q and k/v hidden dims to match")
+        if btq != batch * tokens_q or btk != batch * tokens_k:
+            raise ValueError("attention_full shape mismatch with batch/tokens")
+        if hd % heads != 0:
+            raise ValueError("attention_full requires hidden_dim divisible by heads")
+
+        head_dim = hd // heads
+        self.inputs = (q, k, v)
+        self.batch = batch
+        self.tokens_q = tokens_q
+        self.tokens_k = tokens_k
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale_bits = float_to_uint(1.0 / np.sqrt(float(head_dim)))
+
+        out_handle = lib.CreateBuffer(None, q.size)
+        probs_handle = lib.CreateBuffer(None, batch * heads * tokens_q * tokens_k)
+        _dispatch(b"attention_forward_full_train",
+                  (q.gpu_buf, k.gpu_buf, v.gpu_buf),
+                  (out_handle, probs_handle),
+                  (q.size + 255) // 256, 1, 1,
+                  u1=batch, u2=tokens_q, u3=tokens_k, u4=heads, u5=head_dim, u6=self.scale_bits, cbSize=24)
+
+        self.probs = Tensor.from_gpu(probs_handle, (batch * heads * tokens_q, tokens_k), track=True)
+        res = Tensor.from_gpu(out_handle, q.shape,
+                              requires_grad=q.requires_grad or k.requires_grad or v.requires_grad)
+        res._ctx = self
+        return res
+
+    def backward(self, grad_output):
+        q, k, v = self.inputs
+        b = self.batch
+        tq = self.tokens_q
+        tk = self.tokens_k
+        h = self.heads
+        d = self.head_dim
+        cb_kwargs = dict(u1=b, u2=tq, u3=tk, u4=h, u5=d, u6=self.scale_bits, cbSize=24)
+
+        if q.requires_grad:
+            dq_handle = lib.CreateBuffer(None, q.size)
+            _dispatch(b"attention_backward_full_dq",
+                      (q.gpu_buf, k.gpu_buf, v.gpu_buf, grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dq_handle,),
+                      (q.size + 255) // 256, 1, 1,
+                      **cb_kwargs)
+            q._accumulate_grad(Tensor.from_gpu(dq_handle, q.shape, track=True))
+
+        if k.requires_grad:
+            dk_handle = lib.CreateBuffer(None, k.size)
+            _dispatch(b"attention_backward_full_dk",
+                      (q.gpu_buf, k.gpu_buf, v.gpu_buf, grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dk_handle,),
+                      (k.size + 255) // 256, 1, 1,
+                      **cb_kwargs)
+            k._accumulate_grad(Tensor.from_gpu(dk_handle, k.shape, track=True))
+
+        if v.requires_grad:
+            dv_handle = lib.CreateBuffer(None, v.size)
+            _dispatch(b"attention_backward_full_dv",
+                      (grad_output.gpu_buf, self.probs.gpu_buf),
+                      (dv_handle,),
+                      (v.size + 255) // 256, 1, 1,
+                      u1=b, u2=tq, u3=tk, u4=h, u5=d, cbSize=24)
+            v._accumulate_grad(Tensor.from_gpu(dv_handle, v.shape, track=True))
+
+        self.probs = None
+
+
+def attention_full(q, k, v, batch, tokens_q, tokens_k, heads):
+    return AttentionFullFunc().forward(q, k, v, batch, tokens_q, tokens_k, heads)
 
 class BatchNorm2dFunc(Function):
     def forward(self, x, gamma, beta, running_mean, running_var, eps=1e-5, momentum=0.1, training=True):
@@ -1202,6 +1916,17 @@ class BatchNorm2d:
         return batchnorm2d(x, self.gamma, self.beta, self.running_mean, self.running_var, self.eps, self.momentum, self.training)
 
 
+class LayerNorm:
+    def __init__(self, features, eps=1e-5):
+        self.features = features
+        self.eps = eps
+        self.gamma = Tensor(np.ones(features, dtype=np.float32), requires_grad=True, track=False)
+        self.beta = Tensor(np.zeros(features, dtype=np.float32), requires_grad=True, track=False)
+
+    def __call__(self, x):
+        return layernorm(x, self.gamma, self.beta, self.eps)
+
+
 class Model:
     """Base class for models. Provides parameter discovery, export, and save/load.
 
@@ -1229,7 +1954,7 @@ class Model:
         raise NotImplementedError
 
     def parameters(self):
-        """Auto-discover all trainable parameters from ConvLayer, DepthwiseConvLayer, Linear, and BatchNorm2d attributes."""
+        """Auto-discover all trainable parameters from common layer attributes."""
         params = []
         for name in dir(self):
             attr = getattr(self, name)
@@ -1238,6 +1963,8 @@ class Model:
             elif isinstance(attr, Linear):
                 params.extend([attr.w, attr.b])
             elif hasattr(attr, '__class__') and attr.__class__.__name__ == 'BatchNorm2d':
+                params.extend([attr.gamma, attr.beta])
+            elif hasattr(attr, '__class__') and attr.__class__.__name__ == 'LayerNorm':
                 params.extend([attr.gamma, attr.beta])
         return params
 

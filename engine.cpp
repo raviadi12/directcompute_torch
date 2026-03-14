@@ -151,6 +151,24 @@ extern "C" __declspec(dllexport) bool CompileShader(const char* name, const wcha
     return true;
 }
 
+extern "C" __declspec(dllexport) bool CompileShaderEx(const char* name, const wchar_t* path, const char* entryPoint) {
+    if (!g_device || !entryPoint || !entryPoint[0]) return false;
+    ID3DBlob *blob = nullptr, *err = nullptr;
+    HRESULT hr = D3DCompileFromFile(path, nullptr, nullptr, entryPoint, "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err);
+    if (FAILED(hr)) {
+        if (err) {
+            OutputDebugStringA((char*)err->GetBufferPointer());
+            err->Release();
+        }
+        return false;
+    }
+    ID3D11ComputeShader* s = nullptr;
+    g_device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s);
+    g_shaders[name] = s;
+    blob->Release();
+    return true;
+}
+
 struct GPUBuffer {
     ID3D11Buffer* buffer;
     ID3D11ShaderResourceView* srv;
