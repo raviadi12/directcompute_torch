@@ -144,7 +144,7 @@ print(f"[GPU] {_GPU_NAME} ({_GPU_VENDOR})")
 print(f"      VRAM: {_VRAM_MB}MB dedicated, {_SHARED_MB}MB shared -> {'iGPU' if _IS_IGPU else 'dGPU'}")
 
 # ── Shader Compilation ──
-shaders = ["matmul_universal", "matmul_coarsened", "add_bias", "relu", "relu_grad", "softmax", "softmax_ce_grad", "bias_grad", "sgd", "loss", 
+shaders = ["matmul_universal", "matmul_coarsened", "matmul_heavy", "add_bias", "relu", "relu_grad", "softmax", "softmax_ce_grad", "bias_grad", "sgd", "loss", 
            "conv_forward_tiled", "conv_backprop_filters_tiled", "conv_backprop_input_fused",
            "maxpool_forward", "maxpool_backward", "grad_accum", "im2col", "conv_reshape", "conv_grad_reshape", "col2im",
            "argmax_correct", "accumulate_scalar",

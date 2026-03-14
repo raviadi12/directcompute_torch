@@ -387,6 +387,11 @@ print("Training complete!")
 
 ## Changelog
 
+### v0.2.1 — The "Heavy Matmul" Update & Transformers
+- **Adaptive Matrix Multiplication**: Added `nn_matmul_heavy.hlsl` (128x128 Tile Size, 8x8 thread workload) specifically designed for very large matrices like those found in AlexNet and Transformers. The C++ engine now dynamically shifts gears between Universal (16x16), Coarsened/dGPU (64x64), and Heavy (128x128) based on matrix dimensions, nearly eliminating the performance gap with PyTorch CUDA on large workloads.
+- **Custom Shaders**: Added `CustomShader` and `custom_unary` APIs. Users can now write pure HLSL inline in Python, dynamically compile it via `D3DCompileFromFile`, and plug it directly into the autograd graph without touching C++.
+- **Transformer Primitives**: Added support for Multi-Head Attention (`attention_forward`, `attention_causal`), LayerNorm, and GELU activations.
+
 ### v0.2.0 — GPU-Side Performance Optimizations
 
 Major GPU performance improvements reducing per-batch time on segmentation workloads:

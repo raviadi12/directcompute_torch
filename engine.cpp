@@ -714,6 +714,16 @@ static void MatMulDispatch(void* a_buf, void* b_buf, void* out_buf,
         }
     }
 
+    if (M >= 128 && N >= 128) {
+        uint32_t tileHeavy = 128;
+        uint32_t threads[3] = {(N + tileHeavy - 1) / tileHeavy, (M + tileHeavy - 1) / tileHeavy, 1};
+        auto it = g_shaders.find("matmul_heavy");
+        if (it != g_shaders.end()) {
+            DispatchInternal(it->second, srvs, 2, uavs, 1, threads, cbData, 16);
+            return;
+        }
+    }
+
     if (M >= 64 && N >= 64) {
         uint32_t threads[3] = {(N + tileC - 1) / tileC, (M + tileC - 1) / tileC, 1};
         auto it = g_shaders.find(shaderName);
